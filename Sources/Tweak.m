@@ -218,25 +218,152 @@ static id RelayCallUpstream(NSString *apiKey, NSDictionary *requestBody,
     return parsed;
 }
 
-/// Picks the assistant text out of a Responses API payload.
-static NSString *RelayTextFromResponse(id parsed) {
+/// Chat content can be a string or an array of parts; Responses wants a string.
+static NSString *RelayFlattenContent(id content) {
+    if ([content isKindOfClass:[NSString class]]) {
+        return content;
+    }
+    if ([content isKindOfClass:[NSArray class]]) {
+        NSMutableString *joined = [NSMutableString string];
+        for (id part in (NSArray *)content) {
+            if ([part isKindOfClass:[NSString class]]) {
+                [joined appendString:part];
+                continue;
+            }
+            if ([part isKindOfClass:[NSDictionary class]]) {
+                id t = ((NSDictionary *)part)[@"text"];
+                if ([t isKindOfClass:[NSString class]]) {
+                    [joined appendString:t];
+                }
+            }
+        }
+        return joined;
+    }
+    return nil;
+}
+
+/// arguments arrive as a JSON string in chat, but may be an object upstream.
+static NSString *RelayArgumentsString(id arguments) {
+    if ([arguments isKindOfClass:[NSString class]]) {
+        return arguments;
+    }
+    if ([arguments isKindOfClass:[NSDictionary class]] || [arguments isKindOfClass:[NSArray class]]) {
+        NSData *json = [NSJSONSerialization dataWithJSONObject:arguments options:0 error:NULL];
+        if (json != nil) {
+            return [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding] ?: @"{}";
+        }
+    }
+    return @"{}";
+}
+
+/// chat tools -> Responses tools.
+static NSArray *RelayMapTools(id tools) {
+    if (![tools isKindOfClass:[NSArray class]]) {
+        return nil;
+    }
+    NSMutableArray *mapped = [NSMutableArray array];
+    for (id tool in (NSArray *)tools) {
+        if (![tool isKindOfClass:[NSDictionary class]]) {
+            continue;
+        }
+        id type = ((NSDictionary *)tool)[@"type"];
+        if ([type isKindOfClass:[NSString class]] && ![type isEqualToString:@"function"]) {
+            continue;  // only function tools exist in this translation
+        }
+        id fn = ((NSDictionary *)tool)[@"function"];
+        if (![fn isKindOfClass:[NSDictionary class]]) {
+            continue;
+        }
+        id name = ((NSDictionary *)fn)[@"name"];
+        if (![name isKindOfClass:[NSString class]] || ((NSString *)name).length == 0) {
+            continue;
+        }
+        NSMutableDictionary *out = [NSMutableDictionary dictionary];
+        out[@"type"] = @"function";
+        out[@"name"] = name;
+        id description = ((NSDictionary *)fn)[@"description"];
+        if ([description isKindOfClass:[NSString class]]) {
+            out[@"description"] = description;
+        }
+        id parameters = ((NSDictionary *)fn)[@"parameters"];
+        out[@"parameters"] = [parameters isKindOfClass:[NSDictionary class]]
+            ? parameters : @{@"type": @"object", @"properties": @{}};
+        out[@"strict"] = @NO;
+        [mapped addObject:out];
+    }
+    return mapped.count > 0 ? mapped : nil;
+}
+
+/// chat tool_choice -> Responses tool_choice.
+static id RelayMapToolChoice(id choice) {
+    if ([choice isKindOfClass:[NSString class]]) {
+        NSString *value = (NSString *)choice;
+        if ([value isEqualToString:@"auto"] || [value isEqualToString:@"none"] ||
+            [value isEqualToString:@"required"]) {
+            return value;
+        }
+        // A bare function name is a valid shorthand in some clients.
+        return @{@"type": @"function", @"name": value};
+    }
+    if ([choice isKindOfClass:[NSDictionary class]]) {
+        id fn = ((NSDictionary *)choice)[@"function"];
+        if ([fn isKindOfClass:[NSDictionary class]]) {
+            id name = ((NSDictionary *)fn)[@"name"];
+            if ([name isKindOfClass:[NSString class]]) {
+                return @{@"type": @"function", @"name": name};
+            }
+        }
+        id name = ((NSDictionary *)choice)[@"name"];
+        if ([name isKindOfClass:[NSString class]]) {
+            return @{@"type": @"function", @"name": name};
+        }
+    }
+    return nil;
+}
+
+/// Reads a Responses payload into its assistant text and its function calls.
+static void RelayParseResponse(id parsed, NSMutableString *text,
+                               NSMutableArray<NSDictionary *> *toolCalls) {
     if (![parsed isKindOfClass:[NSDictionary class]]) {
-        return @"";
+        return;
     }
     id output = ((NSDictionary *)parsed)[@"output"];
     if (![output isKindOfClass:[NSArray class]]) {
-        return @"";
+        return;
     }
-    NSMutableString *text = [NSMutableString string];
     for (id item in (NSArray *)output) {
         if (![item isKindOfClass:[NSDictionary class]]) {
             continue;
         }
-        id type = ((NSDictionary *)item)[@"type"];
-        if ([type isKindOfClass:[NSString class]] && ![type isEqualToString:@"message"]) {
+        NSDictionary *entry = (NSDictionary *)item;
+        id type = entry[@"type"];
+
+        if ([type isKindOfClass:[NSString class]] && [type isEqualToString:@"function_call"]) {
+            NSString *callID = [entry[@"call_id"] isKindOfClass:[NSString class]]
+                ? entry[@"call_id"]
+                : ([entry[@"id"] isKindOfClass:[NSString class]] ? entry[@"id"] : nil);
+            NSString *name = [entry[@"name"] isKindOfClass:[NSString class]] ? entry[@"name"] : nil;
+            if (callID.length == 0 || name.length == 0) {
+                continue;
+            }
+            [toolCalls addObject:@{
+                @"id": callID,
+                @"name": name,
+                @"arguments": RelayArgumentsString(entry[@"arguments"]),
+            }];
             continue;
         }
-        id content = ((NSDictionary *)item)[@"content"];
+
+        if ([type isKindOfClass:[NSString class]] &&
+            ![type isEqualToString:@"message"] && ![type isEqualToString:@"output_message"]) {
+            continue;
+        }
+
+        id content = entry[@"content"];
+        if ([content isKindOfClass:[NSString class]]) {
+            [text appendString:(NSString *)content];
+            continue;
+        }
         if (![content isKindOfClass:[NSArray class]]) {
             continue;
         }
@@ -257,12 +384,11 @@ static NSString *RelayTextFromResponse(id parsed) {
             }
         }
     }
-    return text;
 }
 
 #pragma mark - Request handling
 
-static NSString *RelaySSEChunk(NSString *model, NSString *text) {
+static NSString *RelayMakeChunk(NSString *model, NSDictionary *delta, id finishReason) {
     NSDictionary *chunk = @{
         @"id": @"chatcmpl-local",
         @"object": @"chat.completion.chunk",
@@ -270,16 +396,16 @@ static NSString *RelaySSEChunk(NSString *model, NSString *text) {
         @"model": model ?: @"gpt-6.1-sol",
         @"choices": @[@{
             @"index": @0,
-            @"delta": @{@"role": @"assistant", @"content": text ?: @""},
-            @"finish_reason": @"stop",
+            @"delta": delta ?: @{},
+            @"finish_reason": finishReason ?: (id)[NSNull null],
         }],
     };
     NSData *json = [NSJSONSerialization dataWithJSONObject:chunk options:0 error:NULL];
     if (json == nil) {
-        return @"data: {\"error\":{\"message\":\"could not encode chunk\"}}\n\ndata: [DONE]\n\n";
+        return nil;
     }
-    NSString *body = [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding];
-    return [NSString stringWithFormat:@"data: %@\n\ndata: [DONE]\n\n", body];
+    return [NSString stringWithFormat:@"data: %@\n\n",
+            [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding]];
 }
 
 static NSString *RelaySSEError(NSString *message) {
@@ -381,7 +507,7 @@ static void RelayHandleConnection(int fd) {
     NSString *model = [incoming[@"model"] isKindOfClass:[NSString class]]
         ? incoming[@"model"] : @"gpt-6.1-sol";
 
-    // messages -> input[{role, content}]
+    // messages -> Responses input items.
     NSMutableArray *input = [NSMutableArray array];
     id messages = incoming[@"messages"];
     if ([messages isKindOfClass:[NSArray class]]) {
@@ -389,15 +515,79 @@ static void RelayHandleConnection(int fd) {
             if (![message isKindOfClass:[NSDictionary class]]) {
                 continue;
             }
-            id role = ((NSDictionary *)message)[@"role"];
-            id content = ((NSDictionary *)message)[@"content"];
+            NSDictionary *entry = (NSDictionary *)message;
+            id role = entry[@"role"];
             if (![role isKindOfClass:[NSString class]]) {
                 role = @"user";
             }
-            if (content == nil) {
-                content = @"";
+            NSString *roleString = (NSString *)role;
+
+            // tool result -> function_call_output
+            if ([roleString isEqualToString:@"tool"]) {
+                NSString *callID = nil;
+                id rawCallID = entry[@"tool_call_id"];
+                if ([rawCallID isKindOfClass:[NSString class]]) {
+                    callID = rawCallID;
+                } else if ([rawCallID isKindOfClass:[NSNumber class]]) {
+                    callID = [(NSNumber *)rawCallID stringValue];
+                }
+                if (callID.length == 0) {
+                    continue;  // nothing to attach it to
+                }
+                NSString *output = RelayFlattenContent(entry[@"content"]);
+                if (output == nil) {
+                    output = @"";
+                }
+                [input addObject:@{
+                    @"type": @"function_call_output",
+                    @"call_id": callID,
+                    @"output": output,
+                }];
+                continue;
             }
-            [input addObject:@{@"role": role, @"content": content}];
+
+            NSString *flattened = RelayFlattenContent(entry[@"content"]);
+
+            // assistant turn with calls -> its text, then one function_call each
+            id toolCalls = entry[@"tool_calls"];
+            if ([roleString isEqualToString:@"assistant"] &&
+                [toolCalls isKindOfClass:[NSArray class]] && ((NSArray *)toolCalls).count > 0) {
+                if (flattened.length > 0) {
+                    [input addObject:@{@"role": @"assistant", @"content": flattened}];
+                }
+                for (id call in (NSArray *)toolCalls) {
+                    if (![call isKindOfClass:[NSDictionary class]]) {
+                        continue;
+                    }
+                    NSDictionary *callEntry = (NSDictionary *)call;
+                    id fn = callEntry[@"function"];
+                    if (![fn isKindOfClass:[NSDictionary class]]) {
+                        continue;
+                    }
+                    id name = ((NSDictionary *)fn)[@"name"];
+                    if (![name isKindOfClass:[NSString class]]) {
+                        continue;
+                    }
+                    NSString *callID = [callEntry[@"id"] isKindOfClass:[NSString class]]
+                        ? callEntry[@"id"] : nil;
+                    if (callID.length == 0) {
+                        callID = [NSString stringWithFormat:@"call_%lu",
+                                  (unsigned long)(input.count + 1)];
+                    }
+                    [input addObject:@{
+                        @"type": @"function_call",
+                        @"call_id": callID,
+                        @"name": name,
+                        @"arguments": RelayArgumentsString(((NSDictionary *)fn)[@"arguments"]),
+                    }];
+                }
+                continue;
+            }
+
+            if (flattened == nil) {
+                flattened = @"";
+            }
+            [input addObject:@{@"role": roleString, @"content": flattened}];
         }
     }
     if (input.count == 0) {
@@ -412,8 +602,17 @@ static void RelayHandleConnection(int fd) {
     if ([maxTokens isKindOfClass:[NSNumber class]]) {
         upstream[@"max_output_tokens"] = maxTokens;
     }
-    // temperature is read from the request, but the Responses API is sent the
-    // fields it accepts for this gateway; keep it out of the payload.
+
+    NSArray *tools = RelayMapTools(incoming[@"tools"]);
+    if (tools.count > 0) {
+        upstream[@"tools"] = tools;
+    }
+    id toolChoice = RelayMapToolChoice(incoming[@"tool_choice"]);
+    if (toolChoice != nil) {
+        upstream[@"tool_choice"] = toolChoice;
+    }
+    // temperature is accepted from the caller but not forwarded: this gateway's
+    // Responses endpoint validates strictly and rejects unknown fields.
 
     NSString *error = nil;
     id response = RelayCallUpstream(apiKey, upstream, &error);
@@ -424,9 +623,57 @@ static void RelayHandleConnection(int fd) {
         return;
     }
 
-    NSString *text = RelayTextFromResponse(response);
-    os_log(RelayLog(), "relay ok, %{public}lu chars", (unsigned long)text.length);
-    RelaySendSSE(fd, RelaySSEChunk(model, text));
+    NSMutableString *text = [NSMutableString string];
+    NSMutableArray<NSDictionary *> *toolCalls = [NSMutableArray array];
+    RelayParseResponse(response, text, toolCalls);
+
+    NSMutableString *sse = [NSMutableString string];
+    if (text.length > 0) {
+        // A text-only answer finishes here; with tool calls the call chunk is
+        // the last one and carries the finish reason.
+        NSString *line = RelayMakeChunk(model,
+            @{@"role": @"assistant", @"content": text},
+            toolCalls.count == 0 ? @"stop" : nil);
+        if (line) {
+            [sse appendString:line];
+        }
+    }
+    if (toolCalls.count > 0) {
+        NSMutableArray *deltas = [NSMutableArray array];
+        for (NSUInteger i = 0; i < toolCalls.count; i++) {
+            NSDictionary *call = toolCalls[i];
+            [deltas addObject:@{
+                @"index": @(i),
+                @"id": call[@"id"] ?: @"",
+                @"type": @"function",
+                @"function": @{
+                    @"name": call[@"name"] ?: @"",
+                    @"arguments": call[@"arguments"] ?: @"{}",
+                },
+            }];
+        }
+        NSString *line = RelayMakeChunk(model, @{@"tool_calls": deltas}, @"tool_calls");
+        if (line) {
+            [sse appendString:line];
+        }
+    } else if (text.length == 0) {
+        // Neither text nor a call came back: keep a well-formed empty answer so
+        // the client does not hang waiting for a delta.
+        NSString *line = RelayMakeChunk(model,
+            @{@"role": @"assistant", @"content": @""}, @"stop");
+        if (line) {
+            [sse appendString:line];
+        }
+    }
+    if (sse.length == 0) {
+        sse = [NSMutableString stringWithString:RelaySSEError(@"could not encode chunk")];
+    } else {
+        [sse appendString:@"data: [DONE]\n\n"];
+    }
+
+    os_log(RelayLog(), "relay ok, %{public}lu chars, %{public}lu tool calls",
+           (unsigned long)text.length, (unsigned long)toolCalls.count);
+    RelaySendSSE(fd, sse);
 }
 
 #pragma mark - Listener
