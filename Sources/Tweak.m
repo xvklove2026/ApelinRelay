@@ -464,14 +464,19 @@ static void RelayHandleConnection(int fd) {
 
     os_log(RelayLog(), "relay request %{public}s %{public}s", method.UTF8String, path.UTF8String);
 
-    // GET /v1/models -> the single model Apelin should see.
-    if ([path isEqualToString:@"/v1/models"]) {
+    // The models and chat endpoints are matched by suffix so that any staging
+    // Apelin builds on top of a base URL (with or without a /v1 prefix, and
+    // even one it adds itself) resolves here instead of 404ing.
+    BOOL isModels = [path hasSuffix:@"/models"] || [path isEqualToString:@"models"];
+    BOOL isChat = [path hasSuffix:@"/chat/completions"] || [path hasSuffix:@"chat/completions"];
+
+    if (isModels) {
         NSData *body = [kModelsBody dataUsingEncoding:NSUTF8StringEncoding];
         RelaySendResponse(fd, 200, "OK", @"application/json", body);
         return;
     }
 
-    if (![path isEqualToString:@"/v1/chat/completions"]) {
+    if (!isChat) {
         NSData *body = [@"{\"error\":{\"message\":\"not found\"}}"
                         dataUsingEncoding:NSUTF8StringEncoding];
         RelaySendResponse(fd, 404, "Not Found", @"application/json", body);
