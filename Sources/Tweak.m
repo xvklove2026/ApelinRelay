@@ -45,11 +45,15 @@ static const int kRelayPort = 18791;
 static const NSUInteger kForwardTurns = 16;
 static const NSUInteger kRescueTurns = 6;
 
-// The upstream refuses a request whose history exceeds this many rounds with
-// a "已满 20 轮 / /new" error, whatever the settings sheet says. Keep the
-// window strictly under it so the effective cap is enforced here even when the
-// user dials the panel up to 95 or 200.
-static const NSUInteger kUpstreamCeiling = 18;
+// The upstream now allows a conversation of up to 100 rounds, so the window can
+// grow well past the old 20-round limit. Kept strictly under 100 so a settings
+// value of 200 still cannot trip the upstream cap.
+static const NSUInteger kUpstreamCeiling = 96;
+
+// A live upstream answers with response headers within a few seconds; a stall
+// here is what turns a 5s answer into minutes. If not even headers arrive in
+// this long, the relay drops the connection and retries once on a fresh one.
+static const NSTimeInterval kFirstResponseSeconds = 15.0;
 
 static long RelayPrefInt(NSString *key, long fallback);
 static NSString *RelayResponseErrorText(id payload);
@@ -1155,12 +1159,34 @@ static NSURLSession *RelaySharedStreamSession(void) {
 
 @end
 
-/// Streaming POST to /v1/responses (adds stream:true) over the shared session.
+/// A throwaway session + hub, used for the retry after a stall so the retry
+/// never rides the connection that just hung.
+static NSURLSession *RelayFreshStreamSession(RelayStreamHub **outHub) {
+    RelayStreamHub *hub = [RelayStreamHub new];
+    hub.sinks = [NSMutableDictionary dictionary];
+    NSURLSessionConfiguration *configuration =
+        [NSURLSessionConfiguration ephemeralSessionConfiguration];
+    configuration.timeoutIntervalForRequest = 240;
+    configuration.timeoutIntervalForResource = 240;
+    configuration.HTTPMaximumConnectionsPerHost = 8;
+    configuration.waitsForConnectivity = NO;
+    configuration.requestCachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
+    if (outHub) *outHub = hub;
+    return [NSURLSession sessionWithConfiguration:configuration
+                                        delegate:hub
+                                   delegateQueue:nil];
+}
+
+/// Streaming POST to /v1/responses (adds stream:true) over the given session.
 /// onEvent receives each parsed SSE event; the leftover (non-SSE) body, if any,
 /// comes back in *outRemaining. Returns YES unless the HTTP call itself failed.
+/// *outStalled is set when the upstream sent nothing at all within
+/// kFirstResponseSeconds, which the caller retries on a fresh connection.
 static BOOL RelayStreamUpstream(NSString *apiKey, NSDictionary *baseBody,
+                                NSURLSession *session, RelayStreamHub *hub,
                                 BOOL (^onEvent)(NSString *, NSDictionary *),
-                                NSString **outRemaining, NSString **error) {
+                                NSString **outRemaining, NSString **error,
+                                BOOL *outStalled) {
     NSMutableDictionary *body = [baseBody mutableCopy];
     body[@"stream"] = @YES;
     NSData *send = [NSJSONSerialization dataWithJSONObject:body options:0 error:NULL];
@@ -1205,18 +1231,31 @@ static BOOL RelayStreamUpstream(NSString *apiKey, NSDictionary *baseBody,
         dispatch_semaphore_signal(sem);
     };
 
-    NSURLSession *session = RelaySharedStreamSession();
     NSURLSessionDataTask *task = [session dataTaskWithRequest:req];
-    [RelayStreamHub shared].sinks[@(task.taskIdentifier)] = receiver;
+    hub.sinks[@(task.taskIdentifier)] = receiver;
     [task resume];
 
+    // Stage 1: wait for the response headers. A stall with nothing back at all
+    // is the pathological case, so the caller can retry immediately.
     if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW,
-                                                  (int64_t)(245 * NSEC_PER_SEC))) != 0) {
-        [task cancel];
-        [RelayStreamHub shared].sinks[@(task.taskIdentifier)] = nil;
-        if (outRemaining) *outRemaining = nil;
-        if (error) *error = @"upstream stream timed out";
-        return NO;
+                (int64_t)(kFirstResponseSeconds * NSEC_PER_SEC))) != 0) {
+        if (receiver.statusCode == 0) {
+            [task cancel];
+            hub.sinks[@(task.taskIdentifier)] = nil;
+            if (outRemaining) *outRemaining = nil;
+            if (outStalled) *outStalled = YES;
+            if (error) *error = @"upstream did not respond";
+            return NO;
+        }
+        // Headers already arrived: wait for the rest of the body.
+        if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW,
+                    (int64_t)((240.0 - kFirstResponseSeconds) * NSEC_PER_SEC))) != 0) {
+            [task cancel];
+            hub.sinks[@(task.taskIdentifier)] = nil;
+            if (outRemaining) *outRemaining = nil;
+            if (error) *error = @"upstream stream timed out";
+            return NO;
+        }
     }
     if (outRemaining) {
         *outRemaining = remaining;
@@ -1322,7 +1361,8 @@ static void RelayHandleAnthropicStream(int fd, NSString *apiKey,
 
             NSString *upstreamError = nil;
             NSString *remaining = nil;
-            BOOL ok = RelayStreamUpstream(apiKey, upstream, ^(NSString *name, NSDictionary *payload) {
+            BOOL ok = NO;
+            BOOL (^relayOnEvent)(NSString *, NSDictionary *) = ^BOOL(NSString *name, NSDictionary *payload) {
                 @try {
                     if ([name isEqualToString:@"response.output_item.added"]) {
                         id item = payload[@"item"];
@@ -1391,7 +1431,31 @@ static void RelayHandleAnthropicStream(int fd, NSString *apiKey,
                                  e.reason.UTF8String ?: "?");
                 }
                 return YES;
-            }, &remaining, &upstreamError);
+            };
+
+            // Send it; if the gateway sends nothing at all within the first-
+            // response deadline, retry once on a brand-new connection. No event
+            // has fired at that point, so a retry cannot duplicate output.
+            NSURLSession *retrySession = nil;
+            for (int hop = 0; hop < 2 && !ok; hop++) {
+                RelayStreamHub *hub = nil;
+                NSURLSession *session = nil;
+                if (hop == 0) {
+                    session = RelaySharedStreamSession();
+                    hub = [RelayStreamHub shared];
+                } else {
+                    session = RelayFreshStreamSession(&hub);
+                    retrySession = session;
+                }
+                BOOL stalled = NO;
+                upstreamError = nil;
+                remaining = nil;
+                ok = RelayStreamUpstream(apiKey, upstream, session, hub, relayOnEvent,
+                                         &remaining, &upstreamError, &stalled);
+                if (!stalled) break;
+                os_log(RelayLog(), "relay upstream stalled before headers; retrying on a fresh connection");
+            }
+            if (retrySession) [retrySession finishTasksAndInvalidate];
 
             if (!ok) {
                 RelaySendAnthropicEvent(fd, @"error", @{
