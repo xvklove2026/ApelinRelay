@@ -556,12 +556,25 @@ static NSArray *RelayBuildInput(NSArray *chatMessages) {
 }
 
 /// One upstream round-trip for a chat request with the given message window.
+static id RelayUpstreamOnce(NSString *apiKey, NSString *model, id maxTokens,
+                            NSArray *input, id tools, id toolChoice,
+                            NSString **error);
+
 static id RelayChatOnce(NSString *apiKey, NSString *model, id maxTokens,
                         NSArray *chatMessages, id tools, id toolChoice,
                         NSString **error) {
+    return RelayUpstreamOnce(apiKey, model, maxTokens,
+                             RelayBuildInput(chatMessages), tools, toolChoice, error);
+}
+
+/// One upstream round-trip with a fully-built Responses `input` array; shared
+/// by the OpenAI chat/completions and the Anthropic messages paths.
+static id RelayUpstreamOnce(NSString *apiKey, NSString *model, id maxTokens,
+                            NSArray *input, id tools, id toolChoice,
+                            NSString **error) {
     NSMutableDictionary *upstream = [NSMutableDictionary dictionary];
     upstream[@"model"] = model;
-    upstream[@"input"] = RelayBuildInput(chatMessages);
+    upstream[@"input"] = input;
     if ([maxTokens isKindOfClass:[NSNumber class]]) {
         upstream[@"max_output_tokens"] = maxTokens;
     }
@@ -582,9 +595,14 @@ static BOOL RelayIsTurnLimitNotice(NSString *text) {
         return NO;
     }
     return [text containsString:@"满 20 轮"] ||
+           [text containsString:@"满20轮"] ||
+           [text containsString:@"达到上限"] ||
+           [text containsString:@"已回复 105 轮"] ||
            [text containsString:@"reached 20 turns"] ||
            [text containsString:@"has reached 20 turns"] ||
-           [text containsString:@"满20轮"];
+           [text containsString:@"reached 105"] ||
+           [text containsString:@"model turns"] ||
+           [text containsString:@"/compact"];
 }
 
 /// Reads a long integer from the package's preferences domain; the settings
@@ -640,6 +658,383 @@ static NSUInteger RelayCountTurns(NSArray *messages) {
     return count;
 }
 
+#pragma mark - Anthropic /v1/messages
+
+// The relay can also sit in front of an "Anthropic API" slot in Apelin, so the
+// same dylib serves the Anthropic Messages API and translates it to the
+// Responses endpoint, reusing the trim/retry logic. This lets com.xx.xingchiapi
+// occupy the Anthropic slot instead of the OpenAI-compatible one.
+
+static void RelaySendSSEHeader(int fd) {
+    NSString *head = @"HTTP/1.1 200 OK\r\n"
+                     "Content-Type: text/event-stream\r\n"
+                     "Connection: close\r\n"
+                     "\r\n";
+    NSData *data = [head dataUsingEncoding:NSUTF8StringEncoding];
+    RelayWriteAll(fd, data.bytes, data.length);
+}
+
+static void RelaySendAnthropicEvent(int fd, NSString *eventName, NSDictionary *payload) {
+    NSData *json = [NSJSONSerialization dataWithJSONObject:payload options:0 error:NULL];
+    if (json == nil) {
+        return;
+    }
+    NSString *body = [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding];
+    NSString *frame = [NSString stringWithFormat:@"event: %@\ndata: %@\n\n", eventName, body];
+    NSData *data = [frame dataUsingEncoding:NSUTF8StringEncoding];
+    RelayWriteAll(fd, data.bytes, data.length);
+}
+
+/// Flattens an Anthropic content field (a string or a list of blocks) to text.
+static NSString *RelayAnthropicText(id content) {
+    if ([content isKindOfClass:[NSString class]]) {
+        return content;
+    }
+    if (![content isKindOfClass:[NSArray class]]) {
+        return @"";
+    }
+    NSMutableString *text = [NSMutableString string];
+    for (id part in (NSArray *)content) {
+        if (![part isKindOfClass:[NSDictionary class]]) {
+            continue;
+        }
+        id type = ((NSDictionary *)part)[@"type"];
+        if (![type isKindOfClass:[NSString class]] || ![type isEqualToString:@"text"]) {
+            continue;
+        }
+        id t = ((NSDictionary *)part)[@"text"];
+        if ([t isKindOfClass:[NSString class]]) {
+            [text appendString:t];
+        }
+    }
+    return text;
+}
+
+static id RelayAnthropicParseArguments(id arguments) {
+    if ([arguments isKindOfClass:[NSDictionary class]] ||
+        [arguments isKindOfClass:[NSArray class]]) {
+        return arguments;
+    }
+    if (![arguments isKindOfClass:[NSString class]]) {
+        return @{};
+    }
+    NSData *data = [(NSString *)arguments dataUsingEncoding:NSUTF8StringEncoding];
+    id parsed = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL] : nil;
+    return [parsed isKindOfClass:[NSDictionary class]] ? parsed : @{};
+}
+
+/// Anthropic messages (with tool_use / tool_result blocks) -> Responses input.
+static NSArray *RelayBuildAnthropicInput(NSArray *messages, NSString *system) {
+    NSMutableArray *input = [NSMutableArray array];
+    if (system.length > 0) {
+        [input addObject:@{@"role": @"system", @"content": system}];
+    }
+    for (id message in messages) {
+        if (![message isKindOfClass:[NSDictionary class]]) {
+            continue;
+        }
+        NSDictionary *entry = (NSDictionary *)message;
+        id role = entry[@"role"];
+        if (![role isKindOfClass:[NSString class]]) {
+            role = @"user";
+        }
+        NSString *roleString = (NSString *)role;
+
+        id content = entry[@"content"];
+        if (roleString.length == 0) {
+            continue;
+        }
+
+        // Anthropic content is a list of blocks; walk them into Responses items.
+        if ([content isKindOfClass:[NSArray class]]) {
+            for (id rawBlock in (NSArray *)content) {
+                if (![rawBlock isKindOfClass:[NSDictionary class]]) {
+                    continue;
+                }
+                NSDictionary *block = (NSDictionary *)rawBlock;
+                id type = block[@"type"];
+
+                if ([type isKindOfClass:[NSString class]] && [type isEqualToString:@"tool_use"]) {
+                    NSString *callID = [block[@"id"] isKindOfClass:[NSString class]] ? block[@"id"] : nil;
+                    NSString *name = [block[@"name"] isKindOfClass:[NSString class]] ? block[@"name"] : nil;
+                    if (callID.length == 0 || name.length == 0) {
+                        continue;
+                    }
+                    [input addObject:@{
+                        @"type": @"function_call",
+                        @"call_id": callID,
+                        @"name": name,
+                        @"arguments": RelayArgumentsString(block[@"input"]),
+                    }];
+                } else if ([type isKindOfClass:[NSString class]] && [type isEqualToString:@"tool_result"]) {
+                    NSString *callID = [block[@"tool_use_id"] isKindOfClass:[NSString class]]
+                        ? block[@"tool_use_id"] : nil;
+                    if (callID.length == 0) {
+                        continue;
+                    }
+                    NSString *output = RelayAnthropicText(block[@"content"]);
+                    [input addObject:@{
+                        @"type": @"function_call_output",
+                        @"call_id": callID,
+                        @"output": output.length > 0 ? output : @"",
+                    }];
+                } else if ([type isKindOfClass:[NSString class]] && [type isEqualToString:@"text"]) {
+                    id t = block[@"text"];
+                    if ([t isKindOfClass:[NSString class]]) {
+                        [input addObject:@{@"role": roleString, @"content": t}];
+                    }
+                }
+                // image and other blocks are left out: text and tool flow only.
+            }
+            continue;
+        }
+
+        // Plain string content.
+        NSString *text = [content isKindOfClass:[NSString class]] ? content : @"";
+        if (text.length > 0) {
+            [input addObject:@{@"role": roleString, @"content": text}];
+        }
+        // An empty assistant/user message is simply dropped.
+    }
+    if (input.count == 0) {
+        [input addObject:@{@"role": @"user", @"content": @""}];
+    }
+    return input;
+}
+
+/// Anthropic tools -> Responses function tools.
+static NSArray *RelayMapAnthropicTools(id tools) {
+    if (![tools isKindOfClass:[NSArray class]]) {
+        return nil;
+    }
+    NSMutableArray *mapped = [NSMutableArray array];
+    for (id tool in (NSArray *)tools) {
+        if (![tool isKindOfClass:[NSDictionary class]]) {
+            continue;
+        }
+        id name = ((NSDictionary *)tool)[@"name"];
+        if (![name isKindOfClass:[NSString class]] || ((NSString *)name).length == 0) {
+            continue;
+        }
+        NSMutableDictionary *out = [NSMutableDictionary dictionary];
+        out[@"type"] = @"function";
+        out[@"name"] = name;
+        id description = ((NSDictionary *)tool)[@"description"];
+        if ([description isKindOfClass:[NSString class]]) {
+            out[@"description"] = description;
+        }
+        id schema = ((NSDictionary *)tool)[@"input_schema"];
+        out[@"parameters"] = [schema isKindOfClass:[NSDictionary class]]
+            ? schema : @{@"type": @"object", @"properties": @{}};
+        out[@"strict"] = @NO;
+        [mapped addObject:out];
+    }
+    return mapped.count > 0 ? mapped : nil;
+}
+
+/// Anthropic tool_choice -> Responses tool_choice.
+static id RelayMapAnthropicToolChoice(id choice) {
+    if ([choice isKindOfClass:[NSString class]]) {
+        NSString *value = (NSString *)choice;
+        if ([value isEqualToString:@"auto"] || [value isEqualToString:@"none"]) {
+            return value;
+        }
+        if ([value isEqualToString:@"any"]) {
+            return @"required";
+        }
+    }
+    if ([choice isKindOfClass:[NSDictionary class]]) {
+        id type = ((NSDictionary *)choice)[@"type"];
+        id name = ((NSDictionary *)choice)[@"name"];
+        if ([type isKindOfClass:[NSString class]] && [type isEqualToString:@"tool"] &&
+            [name isKindOfClass:[NSString class]]) {
+            return @{@"type": @"function", @"name": name};
+        }
+    }
+    return nil;
+}
+
+/// Serves one Anthropic /v1/messages request end to end.
+static void RelayHandleAnthropic(int fd, NSDictionary *incoming, NSString *apiKey) {
+    @try {
+        NSString *model = [incoming[@"model"] isKindOfClass:[NSString class]]
+            ? incoming[@"model"] : @"gpt-6.1-sol";
+        BOOL stream = [incoming[@"stream"] isKindOfClass:[NSNumber class]]
+            ? [incoming[@"stream"] boolValue]
+            : ([incoming[@"stream"] isKindOfClass:[NSString class]] &&
+               [incoming[@"stream"] boolValue]);
+
+        NSString *system = RelayAnthropicText(incoming[@"system"]);
+        NSArray *messages = [incoming[@"messages"] isKindOfClass:[NSArray class]]
+            ? (NSArray *)incoming[@"messages"] : @[];
+        id maxTokens = incoming[@"max_tokens"];
+        id tools = RelayMapAnthropicTools(incoming[@"tools"]);
+        id toolChoice = RelayMapAnthropicToolChoice(incoming[@"tool_choice"]);
+
+        NSUInteger forwardTurns = (NSUInteger)RelayPrefInt(@"relayMaxTurns", kForwardTurns);
+        NSUInteger rescueTurns  = (NSUInteger)RelayPrefInt(@"relayRescueTurns", kRescueTurns);
+        if (forwardTurns < 1) forwardTurns = 1;
+        if (rescueTurns < 1) rescueTurns = 1;
+        if (rescueTurns > forwardTurns) rescueTurns = forwardTurns;
+
+        NSUInteger caps[2] = { forwardTurns, rescueTurns };
+        id response = nil;
+        NSString *error = nil;
+        NSMutableString *text = [NSMutableString string];
+        NSMutableArray<NSDictionary *> *toolCalls = [NSMutableArray array];
+        NSUInteger usedTurns = 0;
+
+        for (int shot = 0; shot < 2; shot++) {
+            NSArray *window = RelayTrimMessages(messages, caps[shot]);
+            usedTurns = RelayCountTurns(window);
+            error = nil;
+            response = RelayUpstreamOnce(apiKey, model, maxTokens,
+                                         RelayBuildAnthropicInput(window, system),
+                                         tools, toolChoice, &error);
+            if (response == nil) {
+                break;
+            }
+            [text setString:@""];
+            [toolCalls removeAllObjects];
+            RelayParseResponse(response, text, toolCalls);
+            if (!RelayIsTurnLimitNotice(text)) {
+                break;
+            }
+            if (shot + 1 < 2) {
+                NSArray *nextWindow = RelayTrimMessages(messages, caps[shot + 1]);
+                if (nextWindow.count >= window.count) {
+                    break;
+                }
+            }
+        }
+
+        RelayPrefSetInt(@"lastTurnsUsed", (long)usedTurns);
+        RelayPrefSetInt(@"lastRelayUse", (long)[[NSDate date] timeIntervalSince1970]);
+
+        if (response == nil) {
+            os_log(RelayLog(), "relay anthropic upstream error: %{public}s",
+                   (error ?: @"unknown").UTF8String);
+            NSDictionary *errObj = @{
+                @"type": @"error",
+                @"error": @{@"type": @"api_error", @"message": error ?: @"unknown error"},
+            };
+            if (stream) {
+                RelaySendSSEHeader(fd);
+                RelaySendAnthropicEvent(fd, @"error", errObj);
+            } else {
+                NSData *body = [NSJSONSerialization dataWithJSONObject:errObj options:0 error:NULL];
+                RelaySendResponse(fd, 502, "Bad Gateway", @"application/json", body);
+            }
+            return;
+        }
+
+        NSMutableArray *contentPlan = [NSMutableArray array];
+        if (text.length > 0) {
+            [contentPlan addObject:@{@"type": @"text", @"text": text}];
+        }
+        for (NSDictionary *call in toolCalls) {
+            [contentPlan addObject:@{
+                @"type": @"tool_use",
+                @"id": call[@"id"] ?: @"",
+                @"name": call[@"name"] ?: @"",
+                @"input": RelayAnthropicParseArguments(call[@"arguments"]),
+                @"argsJson": RelayArgumentsString(call[@"arguments"]),
+            }];
+        }
+        if (contentPlan.count == 0) {
+            [contentPlan addObject:@{@"type": @"text", @"text": @""}];
+        }
+
+        // Final content blocks for non-stream, without the internal argsJson key.
+        NSMutableArray *blocks = [NSMutableArray array];
+        for (NSDictionary *plan in contentPlan) {
+            NSMutableDictionary *b = [plan mutableCopy];
+            [b removeObjectForKey:@"argsJson"];
+            [blocks addObject:b];
+        }
+        NSString *stopReason = toolCalls.count > 0 ? @"tool_use" : @"end_turn";
+
+        if (stream) {
+            RelaySendSSEHeader(fd);
+            RelaySendAnthropicEvent(fd, @"message_start", @{
+                @"type": @"message_start",
+                @"message": @{
+                    @"id": @"msg_local_relay",
+                    @"type": @"message",
+                    @"role": @"assistant",
+                    @"model": model,
+                    @"content": @[],
+                    @"stop_reason": (id)[NSNull null],
+                    @"stop_sequence": (id)[NSNull null],
+                    @"usage": @{@"input_tokens": @0, @"output_tokens": @1},
+                },
+            });
+            for (NSUInteger i = 0; i < contentPlan.count; i++) {
+                NSDictionary *plan = contentPlan[i];
+                BOOL isToolUse = [plan[@"type"] isEqualToString:@"tool_use"];
+                if (isToolUse) {
+                    RelaySendAnthropicEvent(fd, @"content_block_start", @{
+                        @"type": @"content_block_start",
+                        @"index": @(i),
+                        @"content_block": @{
+                            @"type": @"tool_use",
+                            @"id": plan[@"id"] ?: @"",
+                            @"name": plan[@"name"] ?: @"",
+                            @"input": @{},
+                        },
+                    });
+                    RelaySendAnthropicEvent(fd, @"content_block_delta", @{
+                        @"type": @"content_block_delta",
+                        @"index": @(i),
+                        @"delta": @{
+                            @"type": @"input_json_delta",
+                            @"partial_json": plan[@"argsJson"] ?: @"{}",
+                        },
+                    });
+                } else {
+                    RelaySendAnthropicEvent(fd, @"content_block_start", @{
+                        @"type": @"content_block_start",
+                        @"index": @(i),
+                        @"content_block": @{@"type": @"text", @"text": @""},
+                    });
+                    RelaySendAnthropicEvent(fd, @"content_block_delta", @{
+                        @"type": @"content_block_delta",
+                        @"index": @(i),
+                        @"delta": @{@"type": @"text_delta", @"text": plan[@"text"] ?: @""},
+                    });
+                }
+                RelaySendAnthropicEvent(fd, @"content_block_stop", @{
+                    @"type": @"content_block_stop",
+                    @"index": @(i),
+                });
+            }
+            RelaySendAnthropicEvent(fd, @"message_delta", @{
+                @"type": @"message_delta",
+                @"delta": @{@"stop_reason": stopReason, @"stop_sequence": (id)[NSNull null]},
+                @"usage": @{@"output_tokens": @(contentPlan.count)},
+            });
+            RelaySendAnthropicEvent(fd, @"message_stop", @{@"type": @"message_stop"});
+            return;
+        }
+
+        NSDictionary *message = @{
+            @"id": @"msg_local_relay",
+            @"type": @"message",
+            @"role": @"assistant",
+            @"model": model,
+            @"content": blocks,
+            @"stop_reason": stopReason,
+            @"stop_sequence": (id)[NSNull null],
+            @"usage": @{@"input_tokens": @0, @"output_tokens": @(blocks.count)},
+        };
+        NSData *body = [NSJSONSerialization dataWithJSONObject:message options:0 error:NULL];
+        RelaySendResponse(fd, 200, "OK", @"application/json", body);
+    } @catch (NSException *e) {
+        os_log_error(RelayLog(), "relay anthropic handler exception: %{public}s",
+                     e.reason.UTF8String ?: "?");
+    }
+}
+
 static void RelayHandleConnection(int fd) {
     NSData *raw = RelayReadRequest(fd);
     if (raw == nil || raw.length == 0) {
@@ -692,6 +1087,7 @@ static void RelayHandleConnection(int fd) {
     // even one it adds itself) resolves here instead of 404ing.
     BOOL isModels = [path hasSuffix:@"/models"] || [path isEqualToString:@"models"];
     BOOL isChat = [path hasSuffix:@"/chat/completions"] || [path hasSuffix:@"chat/completions"];
+    BOOL isMessages = [path hasSuffix:@"/messages"] || [path isEqualToString:@"messages"];
 
     if (isModels) {
         NSData *body = [kModelsBody dataUsingEncoding:NSUTF8StringEncoding];
@@ -699,7 +1095,7 @@ static void RelayHandleConnection(int fd) {
         return;
     }
 
-    if (!isChat) {
+    if (!isChat && !isMessages) {
         NSData *body = [@"{\"error\":{\"message\":\"not found\"}}"
                         dataUsingEncoding:NSUTF8StringEncoding];
         RelaySendResponse(fd, 404, "Not Found", @"application/json", body);
@@ -732,6 +1128,12 @@ static void RelayHandleConnection(int fd) {
     }
 
     NSDictionary *incoming = (NSDictionary *)parsedBody;
+
+    if (isMessages) {
+        RelayHandleAnthropic(fd, incoming, apiKey);
+        return;
+    }
+
     NSString *model = [incoming[@"model"] isKindOfClass:[NSString class]]
         ? incoming[@"model"] : @"gpt-6.1-sol";
 
@@ -782,8 +1184,10 @@ static void RelayHandleConnection(int fd) {
         }
     }
 
-    // Remember how many rounds the latest request actually used, for the badge.
+    // Remember how many rounds the latest request actually used, for the badge,
+    // and that the relay was just used, so the Apelin-side pill lights up.
     RelayPrefSetInt(@"lastTurnsUsed", (long)usedTurns);
+    RelayPrefSetInt(@"lastRelayUse", (long)[[NSDate date] timeIntervalSince1970]);
 
     if (response == nil) {
         os_log(RelayLog(), "relay upstream error: %{public}s", (error ?: @"unknown").UTF8String);
@@ -1039,6 +1443,7 @@ static NSURLSessionDataTask *HookedDataTaskURL(id self, SEL _cmd, NSURL *url) {
         [win addSubview:pill];
         [win bringSubviewToFront:pill];
 
+        RelayPrefSetInt(@"overlayShown", 1);  // durable "pill actually built" proof
         os_log(RelayLog(), "relay overlay shown in Apelin");
         [self refresh];
 
@@ -1059,9 +1464,15 @@ static NSURLSessionDataTask *HookedDataTaskURL(id self, SEL _cmd, NSURL *url) {
         return;
     }
     @try {
-        // Show only while Apelin has talked to the relay/upstream recently.
-        BOOL show = (HidLastActive != nil) &&
-                    [HidLastActive timeIntervalSinceNow] > -30.0;
+        // Show only while the relay is in use. Two signals: the SpringBoard
+        // relay stamps lastRelayUse into the shared domain on every request it
+        // serves (primary, works regardless of Apelin's networking internals),
+        // and the in-process NSURLSession hooks set HidLastActive (backup).
+        long now = (long)[[NSDate date] timeIntervalSince1970];
+        long lastRelayUse = RelayPrefInt(@"lastRelayUse", 0);
+        BOOL relayRecent = (lastRelayUse != 0) && (now - lastRelayUse) < 30;
+        BOOL sessionRecent = (HidLastActive != nil) && [HidLastActive timeIntervalSinceNow] > -30.0;
+        BOOL show = relayRecent || sessionRecent;
         HidPillView.hidden = !show;
         if (!show) {
             return;
