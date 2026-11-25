@@ -1337,6 +1337,13 @@ static void HidNoteURL(NSURL *url) {
         BOOL isXingchi = [host isEqualToString:@"api.xingchiapi.com"];
         if (isRelay || isXingchi) {
             HidLastActive = [NSDate date];
+            // Observability: remember which of the two endpoints was seen, but
+            // only persist when it changes so we are not writing prefs per call.
+            static NSString *lastHost = nil;
+            if (![lastHost isEqualToString:host]) {
+                lastHost = host;
+                RelayPrefSetInt(@"hookLast", isXingchi ? 2 : 1);
+            }
         }
     } @catch (NSException *e) {
         os_log_error(RelayLog(), "relay hook url failed: %{public}s", e.reason.UTF8String ?: "?");
@@ -1502,7 +1509,7 @@ static NSURLSessionDataTask *HookedDataTaskURL(id self, SEL _cmd, NSURL *url) {
         }
         [self removeSettings];
 
-        CGFloat width = 300, height = 170;
+        CGFloat width = 300, height = 224;
         UIView *sheet = [[UIView alloc]
             initWithFrame:CGRectMake((win.bounds.size.width - width) / 2.0,
                                      (win.bounds.size.height - height) / 2.0,
@@ -1516,25 +1523,43 @@ static NSURLSessionDataTask *HookedDataTaskURL(id self, SEL _cmd, NSURL *url) {
         title.textColor = UIColor.whiteColor;
         title.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
         title.textAlignment = NSTextAlignmentCenter;
-        title.frame = CGRectMake(16, 16, width - 32, 22);
+        title.frame = CGRectMake(16, 14, width - 32, 22);
         [sheet addSubview:title];
 
-        UILabel *valueLabel = [UILabel new];
-        valueLabel.textColor = UIColor.whiteColor;
-        valueLabel.font = [UIFont monospacedDigitSystemFontOfSize:14 weight:UIFontWeightRegular];
-        valueLabel.textAlignment = NSTextAlignmentCenter;
-        valueLabel.frame = CGRectMake(16, 46, width - 32, 20);
-        valueLabel.tag = 0x5842;
-        [sheet addSubview:valueLabel];
+        UILabel *hint = [UILabel new];
+        hint.text = @"范围 10–200,可拖动滑杆或直接输入";
+        hint.textColor = [UIColor colorWithWhite:0.9 alpha:0.85];
+        hint.font = [UIFont systemFontOfSize:12];
+        hint.textAlignment = NSTextAlignmentCenter;
+        hint.frame = CGRectMake(12, 40, width - 24, 16);
+        [sheet addSubview:hint];
 
         UISlider *slider = [UISlider new];
-        slider.minimumValue = 4;
-        slider.maximumValue = 50;
-        slider.value = (float)RelayPrefInt(@"relayMaxTurns", (long)kForwardTurns);
-        slider.frame = CGRectMake(20, 78, width - 40, 30);
+        slider.minimumValue = 10;
+        slider.maximumValue = 200;
+        long current = RelayPrefInt(@"relayMaxTurns", (long)kForwardTurns);
+        if (current < 10) current = 10;
+        if (current > 200) current = 200;
+        slider.value = (float)current;
+        slider.frame = CGRectMake(20, 62, width - 40, 30);
         [slider addTarget:self action:@selector(sliderChanged:)
            forControlEvents:UIControlEventValueChanged];
         [sheet addSubview:slider];
+
+        UITextField *field = [UITextField new];
+        field.frame = CGRectMake((width - 120) / 2.0, 100, 120, 34);
+        field.keyboardType = UIKeyboardTypeNumberPad;
+        field.text = [NSString stringWithFormat:@"%ld", current];
+        field.textColor = UIColor.whiteColor;
+        field.textAlignment = NSTextAlignmentCenter;
+        field.font = [UIFont monospacedDigitSystemFontOfSize:16 weight:UIFontWeightSemibold];
+        field.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.35];
+        field.layer.cornerRadius = 8;
+        field.clipsToBounds = YES;
+        field.tag = 0x5843;
+        [field addTarget:self action:@selector(fieldChanged:)
+           forControlEvents:UIControlEventEditingChanged];
+        [sheet addSubview:field];
 
         UIButton *done = [UIButton buttonWithType:UIButtonTypeCustom];
         done.frame = CGRectMake(0, height - 46, width, 46);
@@ -1544,30 +1569,42 @@ static NSURLSessionDataTask *HookedDataTaskURL(id self, SEL _cmd, NSURL *url) {
         [done addTarget:self action:@selector(doneTapped:) forControlEvents:UIControlEventTouchUpInside];
         [sheet addSubview:done];
 
-        [self setValueLabel:valueLabel fromSlider:slider];
         [win addSubview:sheet];
         [win bringSubviewToFront:sheet];
         HidSettingsSheet = sheet;
+        [field becomeFirstResponder];
     } @catch (NSException *e) {
         os_log_error(RelayLog(), "relay overlay settings failed: %{public}s",
                      e.reason.UTF8String ?: "?");
     }
 }
 
-+ (void)setValueLabel:(UILabel *)label fromSlider:(UISlider *)slider {
-    label.text = [NSString stringWithFormat:@"%ld 轮", (long)lround(slider.value)];
++ (long)clamp:(long)value low:(long)low high:(long)high {
+    if (value < low) return low;
+    if (value > high) return high;
+    return value;
+}
+
++ (UITextField *)settingsFieldIn:(UIView *)view {
+    UITextField *field = [view viewWithTag:0x5843];
+    return [field isKindOfClass:[UITextField class]] ? field : nil;
+}
+
++ (void)syncFieldFromSlider:(UISlider *)slider {
+    if (slider.superview == nil) {
+        return;
+    }
+    UITextField *field = [self settingsFieldIn:slider.superview];
+    if (field != nil) {
+        field.text = [NSString stringWithFormat:@"%ld", (long)lround(slider.value)];
+    }
 }
 
 + (void)sliderChanged:(UISlider *)slider {
     @try {
-        long value = (long)lround(slider.value);
+        long value = [self clamp:(long)lround(slider.value) low:10 high:200];
         RelayPrefSetInt(@"relayMaxTurns", value);
-        if (slider.superview != nil) {
-            UILabel *valueLabel = [slider.superview viewWithTag:0x5842];
-            if ([valueLabel isKindOfClass:[UILabel class]]) {
-                [self setValueLabel:valueLabel fromSlider:slider];
-            }
-        }
+        [self syncFieldFromSlider:slider];
         [self refresh];
     } @catch (NSException *e) {
         os_log_error(RelayLog(), "relay overlay slider failed: %{public}s",
@@ -1575,7 +1612,49 @@ static NSURLSessionDataTask *HookedDataTaskURL(id self, SEL _cmd, NSURL *url) {
     }
 }
 
++ (void)fieldChanged:(UITextField *)field {
+    @try {
+        long value = [field.text longLongValue];
+        if (value >= 10 && value <= 200) {
+            RelayPrefSetInt(@"relayMaxTurns", value);
+        }
+        if (field.superview != nil) {
+            UISlider *slider = [self sliderIn:field.superview];
+            if (slider != nil) {
+                slider.value = (float)[self clamp:value low:10 high:200];
+            }
+        }
+        [self refresh];
+    } @catch (NSException *e) {
+        os_log_error(RelayLog(), "relay overlay field failed: %{public}s",
+                     e.reason.UTF8String ?: "?");
+    }
+}
+
++ (UISlider *)sliderIn:(UIView *)view {
+    for (UIView *sub in view.subviews) {
+        if ([sub isKindOfClass:[UISlider class]]) {
+            return (UISlider *)sub;
+        }
+    }
+    return nil;
+}
+
 + (void)doneTapped:(id)sender {
+    @try {
+        UIView *sheet = HidSettingsSheet;
+        if (sheet != nil) {
+            UITextField *field = [self settingsFieldIn:sheet];
+            if (field != nil) {
+                long value = [self clamp:[field.text longLongValue] low:10 high:200];
+                RelayPrefSetInt(@"relayMaxTurns", value);
+            }
+            [field resignFirstResponder];
+        }
+    } @catch (NSException *e) {
+        os_log_error(RelayLog(), "relay overlay done failed: %{public}s",
+                     e.reason.UTF8String ?: "?");
+    }
     [self removeSettings];
     [self refresh];
 }
