@@ -21,7 +21,7 @@
 #include <errno.h>
 #include <string.h>
 
-static NSString *const kRelaySubsystem   = @"local.apelin.apelinrelay";
+static NSString *const kRelaySubsystem   = @APELIN_PACKAGE_ID;
 static NSString *const kUpstreamURL      = @"https://api.xingchiapi.com/v1/responses";
 static NSString *const kFallbackKey      = @"sk-46e396dad8763b5a6e460c7b1f3b9ebc02e8c8de6a930f53eaa0ca433ad4a481";
 static NSString *const kModelsBody       =
@@ -33,7 +33,7 @@ static os_log_t RelayLog(void) {
     static os_log_t log;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        log = os_log_create("local.apelin.apelinrelay", "relay");
+        log = os_log_create(APELIN_PACKAGE_ID, "relay");
     });
     return log;
 }
