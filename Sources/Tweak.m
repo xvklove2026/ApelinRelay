@@ -171,7 +171,9 @@ static id RelayCallUpstream(NSString *apiKey, NSDictionary *requestBody,
     NSURL *url = [NSURL URLWithString:kUpstreamURL];
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
     req.HTTPMethod = @"POST";
-    req.timeoutInterval = 110.0;
+    // A very large history (or a heavy model run) can take the gateway minutes;
+    // 110 s used to fail those as "timed out". Give it 240 s.
+    req.timeoutInterval = 240.0;
     [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
     [req setValue:[NSString stringWithFormat:@"Bearer %@", apiKey]
         forHTTPHeaderField:@"Authorization"];
@@ -193,7 +195,7 @@ static id RelayCallUpstream(NSString *apiKey, NSDictionary *requestBody,
         }];
     [task resume];
     dispatch_semaphore_wait(sem,
-        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(115 * NSEC_PER_SEC)));
+        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(245 * NSEC_PER_SEC)));
 
     if (netError != nil) {
         if (outError) *outError = netError.localizedDescription ?: @"upstream request failed";
@@ -1289,15 +1291,32 @@ static void RelayStartListener(void) {
                     break;
                 }
                 setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
-                @autoreleasepool {
-                    @try {
-                        RelayHandleConnection(client);
-                    } @catch (NSException *e) {
-                        os_log_error(RelayLog(), "relay handler exception: %{public}s",
-                                     e.reason.UTF8String ?: "?");
+
+                // Bound how long a connection may sit without sending anything,
+                // so a dead client never pins a worker forever.
+                struct timeval rcvTimeout;
+                rcvTimeout.tv_sec = 90;
+                rcvTimeout.tv_usec = 0;
+                setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &rcvTimeout, sizeof(rcvTimeout));
+
+                // Handle each connection on its own worker: one slow upstream
+                // call must never block the accept loop, or every later request
+                // (Apelin's next turn, a /v1/models probe) waits in the backlog
+                // and looks like a timeout.
+                int conn = client;
+                dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                    @autoreleasepool {
+                        @try {
+                            RelayHandleConnection(conn);
+                        } @catch (NSException *e) {
+                            os_log_error(RelayLog(), "relay handler exception: %{public}s",
+                                         e.reason.UTF8String ?: "?");
+                        } @catch (...) {
+                            os_log_error(RelayLog(), "relay handler unknown exception");
+                        }
+                        close(conn);
                     }
-                }
-                close(client);
+                });
             }
             close(fd);
         } @catch (NSException *e) {
