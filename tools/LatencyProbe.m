@@ -4,7 +4,8 @@
 // Sign: ldid -STool.entitlements .latency-probe
 // Run: API_KEY=TOKEN ./.latency-probe [pair|direct|relay|limit]
 // pair runs concurrently; limit scans 18/20/21/24/30 user turns serially.
-// Optional: UPSTREAM_URL, RELAY_URL, MODEL. No response bodies or keys are logged.
+// Optional: UPSTREAM_URL, RELAY_URL, MODEL, TURNS (1..96).
+// No response bodies or keys are logged.
 #import <Foundation/Foundation.h>
 #include <stdio.h>
 #include <string.h>
@@ -42,8 +43,8 @@ static id ProbeTime(double value) { return value >= 0 ? @(value) : (id)NSNull.nu
     self.metrics = [NSMutableDictionary dictionary];
     self.headers = self.firstEvent = self.firstContent = self.terminal = -1;
     NSURLSessionConfiguration *config = NSURLSessionConfiguration.ephemeralSessionConfiguration;
-    config.timeoutIntervalForRequest = 60;
-    config.timeoutIntervalForResource = 60;
+    config.timeoutIntervalForRequest = 80;
+    config.timeoutIntervalForResource = 80;
     NSOperationQueue *queue = [[NSOperationQueue alloc] init];
     queue.maxConcurrentOperationCount = 1;
     self.session = [NSURLSession sessionWithConfiguration:config delegate:self delegateQueue:queue];
@@ -201,14 +202,25 @@ int main(int argc, const char *argv[]) {
                     @"url": env[@"UPSTREAM_URL"] ?: @"https://api.xingchiapi.com/v1/responses"}];
             }
         } else {
-            NSArray *messages = @[@{@"role": @"user", @"content": @"Reply with only OK."}];
+            NSInteger turns = env[@"TURNS"] ? [env[@"TURNS"] integerValue] : 1;
+            if (turns < 1 || turns > 96) {
+                fputs("TURNS must be between 1 and 96.\n", stderr); return 2;
+            }
+            NSMutableArray *messages = [NSMutableArray array];
+            for (NSInteger i = 1; i < turns; i++) {
+                [messages addObject:@{@"role": @"user", @"content":
+                    [NSString stringWithFormat:@"Historical request %ld", (long)i]}];
+                [messages addObject:@{@"role": @"assistant", @"content":
+                    [NSString stringWithFormat:@"Historical answer %ld", (long)i]}];
+            }
+            [messages addObject:@{@"role": @"user", @"content": @"Reply with only OK."}];
             NSDictionary *direct = @{@"model": model, @"max_output_tokens": @64,
                 @"stream": @YES, @"input": messages};
             NSDictionary *relay = @{@"model": model, @"max_tokens": @64,
                 @"stream": @YES, @"messages": messages};
-            if (includeDirect) [specs addObject:@{@"label": @"direct", @"body": direct,
+            if (includeDirect) [specs addObject:@{@"label": @"direct", @"body": direct, @"turns": @(turns),
                 @"url": env[@"UPSTREAM_URL"] ?: @"https://api.xingchiapi.com/v1/responses"}];
-            if (![mode isEqualToString:@"direct"]) [specs addObject:@{@"label": @"relay", @"body": relay,
+            if (![mode isEqualToString:@"direct"]) [specs addObject:@{@"label": @"relay", @"body": relay, @"turns": @(turns),
                 @"url": env[@"RELAY_URL"] ?: @"http://127.0.0.1:18791/v1/messages"}];
         }
         for (NSDictionary *spec in specs) {
@@ -223,7 +235,7 @@ int main(int argc, const char *argv[]) {
         for (NSDictionary *spec in specs) {
             NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:spec[@"url"]]];
             request.HTTPMethod = @"POST";
-            request.timeoutInterval = 60;
+            request.timeoutInterval = 80;
             [request setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
             [request setValue:@"Minis/1.0" forHTTPHeaderField:@"User-Agent"];
             if (key.length) [request setValue:[@"Bearer " stringByAppendingString:key] forHTTPHeaderField:@"Authorization"];
@@ -241,14 +253,14 @@ int main(int argc, const char *argv[]) {
             };
             [probes addObject:probe];
             [probe startRequest:request label:spec[@"label"]];
-            if (limitMode && dispatch_group_wait(group, dispatch_time(DISPATCH_TIME_NOW, 64 * NSEC_PER_SEC)) != 0) {
+            if (limitMode && dispatch_group_wait(group, dispatch_time(DISPATCH_TIME_NOW, 84 * NSEC_PER_SEC)) != 0) {
                 [probe.task cancel];
-                fputs("Probe exceeded the 64-second deadline.\n", stderr); return 1;
+                fputs("Probe exceeded the 84-second deadline.\n", stderr); return 1;
             }
         }
-        if (!limitMode && dispatch_group_wait(group, dispatch_time(DISPATCH_TIME_NOW, 64 * NSEC_PER_SEC)) != 0) {
+        if (!limitMode && dispatch_group_wait(group, dispatch_time(DISPATCH_TIME_NOW, 84 * NSEC_PER_SEC)) != 0) {
             for (ARLatencyProbe *probe in probes) [probe.task cancel];
-            fputs("Probe exceeded the 64-second deadline.\n", stderr); return 1;
+            fputs("Probe exceeded the 84-second deadline.\n", stderr); return 1;
         }
         for (NSDictionary *result in results) {
             if (![result[@"accepted"] boolValue]) return 1;

@@ -36,12 +36,8 @@ static NSString *const kModelsBody       =
 
 static const int kRelayPort = 18791;
 
-// The upstream caps a conversation around 20 rounds and injects a "start a
-// new session (/new)" notice once the history it is sent exceeds that. To let
-// a session live past it, history is trimmed before forwarding: normally to
-// the last kForwardTurns rounds, and if the notice still comes back, one retry
-// with the much shorter kRescueTurns window. The latest user message is always
-// kept, so a fresh prompt never gets cut.
+// Keep a bounded history and retry a genuine conversation-limit notice with
+// the shorter rescue window. The latest actual user prompt is always retained.
 static const NSUInteger kForwardTurns = 16;
 static const NSUInteger kRescueTurns = 6;
 
@@ -50,10 +46,24 @@ static const NSUInteger kRescueTurns = 6;
 // value of 200 still cannot trip the upstream cap.
 static const NSUInteger kUpstreamCeiling = 96;
 
-// A live upstream answers with response headers within a few seconds; a stall
-// here is what turns a 5s answer into minutes. If not even headers arrive in
-// this long, the relay drops the connection and retries once on a fresh one.
-static const NSTimeInterval kFirstResponseSeconds = 15.0;
+// Metadata and response headers do not count as the first useful token. Give
+// a silent first attempt 20 seconds, then one fresh-connection retry with a
+// more generous budget. Once text or a tool call starts, never replay it.
+typedef struct {
+    NSTimeInterval headers;
+    NSTimeInterval firstContent;
+    NSTimeInterval idleContent;
+    NSTimeInterval total;
+} RelayStreamLimits;
+
+static RelayStreamLimits RelayStreamLimitsForAttempt(NSUInteger attempt) {
+    double scale = 1.0;
+#if defined(APELIN_RELAY_TESTING) && defined(APELIN_RELAY_TEST_TIMEOUT_SCALE)
+    scale = APELIN_RELAY_TEST_TIMEOUT_SCALE;
+#endif
+    return (RelayStreamLimits){15.0 * scale, (attempt ? 45.0 : 20.0) * scale,
+                               60.0 * scale, 240.0 * scale};
+}
 
 static long RelayPrefInt(NSString *key, long fallback);
 static NSString *RelayResponseErrorText(id payload);
@@ -736,6 +746,10 @@ static NSString *RelayResponseErrorText(id payload) {
 /// Reads a long integer from the package's preferences domain; the settings
 /// sheet and the SpringBoard relay share this domain through cfprefsd.
 static long RelayPrefInt(NSString *key, long fallback) {
+#ifdef APELIN_RELAY_TESTING
+    (void)key;
+    return fallback;
+#else
     long result = fallback;
     @try {
         CFPreferencesAppSynchronize((__bridge CFStringRef)kPrefsDomain);
@@ -756,10 +770,15 @@ static long RelayPrefInt(NSString *key, long fallback) {
         os_log_error(RelayLog(), "relay prefs read failed: %{public}s", e.reason.UTF8String ?: "?");
     }
     return result;
+#endif
 }
 
 /// Writes a long integer into the package's preferences domain.
 static void RelayPrefSetInt(NSString *key, long value) {
+#ifdef APELIN_RELAY_TESTING
+    (void)key;
+    (void)value;
+#else
     @try {
         NSNumber *number = @(value);
         CFPreferencesSetAppValue((__bridge CFStringRef)key, (__bridge CFPropertyListRef)number,
@@ -768,6 +787,7 @@ static void RelayPrefSetInt(NSString *key, long value) {
     } @catch (NSException *e) {
         os_log_error(RelayLog(), "relay prefs write failed: %{public}s", e.reason.UTF8String ?: "?");
     }
+#endif
 }
 
 /// Counts actual user rounds; instructions and tool results are not new turns.
@@ -1035,43 +1055,80 @@ static BOOL RelayFeedSSEBuffer(NSMutableData *buffer, NSData *chunk,
 
 @interface RelayStreamHub : NSObject <NSURLSessionDataDelegate>
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, id<RelayStreamSink>> *sinks;
+- (void)registerSink:(id<RelayStreamSink>)sink forTask:(NSURLSessionTask *)task;
+- (void)removeTask:(NSURLSessionTask *)task;
 @end
 
 @implementation RelayStreamHub
 
+- (instancetype)init {
+    self = [super init];
+    if (self) _sinks = [NSMutableDictionary dictionary];
+    return self;
+}
+
 + (instancetype)shared {
     static RelayStreamHub *hub = nil;
     static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        hub = [RelayStreamHub new];
-        hub.sinks = [NSMutableDictionary dictionary];
-    });
+    dispatch_once(&once, ^{ hub = [RelayStreamHub new]; });
     return hub;
+}
+
+- (void)registerSink:(id<RelayStreamSink>)sink forTask:(NSURLSessionTask *)task {
+    @synchronized(self) { self.sinks[@(task.taskIdentifier)] = sink; }
+}
+
+- (void)removeTask:(NSURLSessionTask *)task {
+    @synchronized(self) { [self.sinks removeObjectForKey:@(task.taskIdentifier)]; }
+}
+
+- (id<RelayStreamSink>)sinkForTask:(NSURLSessionTask *)task {
+    @synchronized(self) { return self.sinks[@(task.taskIdentifier)]; }
 }
 
 - (void)URLSession:(NSURLSession *)session
               dataTask:(NSURLSessionDataTask *)dataTask
     didReceiveResponse:(NSURLResponse *)response
      completionHandler:(void (^)(NSURLSessionResponseDisposition))completionHandler {
-    id<RelayStreamSink> sink = self.sinks[@(dataTask.taskIdentifier)];
-    NSInteger status = [response isKindOfClass:[NSHTTPURLResponse class]]
-        ? ((NSHTTPURLResponse *)response).statusCode : 0;
-    [sink relayStreamStatus:status];
-    completionHandler(NSURLSessionResponseAllow);
+    NSURLSessionResponseDisposition disposition = NSURLSessionResponseCancel;
+    @try {
+        id<RelayStreamSink> sink = [self sinkForTask:dataTask];
+        if (sink) {
+            NSInteger status = [response isKindOfClass:[NSHTTPURLResponse class]]
+                ? ((NSHTTPURLResponse *)response).statusCode : 0;
+            [sink relayStreamStatus:status];
+            disposition = NSURLSessionResponseAllow;
+        }
+    } @catch (NSException *e) {
+        os_log_error(RelayLog(), "relay stream response exception");
+    }
+    completionHandler(disposition);
 }
 
 - (void)URLSession:(NSURLSession *)session
           dataTask:(NSURLSessionDataTask *)dataTask
     didReceiveData:(NSData *)data {
-    [[self.sinks objectForKey:@(dataTask.taskIdentifier)] relayStreamData:data task:dataTask];
+    @try {
+        [[self sinkForTask:dataTask] relayStreamData:data task:dataTask];
+    } @catch (NSException *e) {
+        [dataTask cancel];
+        os_log_error(RelayLog(), "relay stream data exception");
+    }
 }
 
 - (void)URLSession:(NSURLSession *)session
               task:(NSURLSessionTask *)task
   didCompleteWithError:(NSError *)error {
-    id<RelayStreamSink> sink = [self.sinks objectForKey:@(task.taskIdentifier)];
-    [self.sinks removeObjectForKey:@(task.taskIdentifier)];
-    [sink relayStreamComplete:error];
+    @try {
+        id<RelayStreamSink> sink;
+        @synchronized(self) {
+            sink = self.sinks[@(task.taskIdentifier)];
+            [self.sinks removeObjectForKey:@(task.taskIdentifier)];
+        }
+        [sink relayStreamComplete:error];
+    } @catch (NSException *e) {
+        os_log_error(RelayLog(), "relay stream completion exception");
+    }
 }
 
 @end
@@ -1098,14 +1155,32 @@ static NSURLSession *RelaySharedStreamSession(void) {
     return session;
 }
 
-/// Receives one streamed upstream response, feeds every complete SSE event to
-/// onEvent, and reports status/remaining text at the end.
+static BOOL RelayStreamEventHasContent(NSString *name, NSDictionary *payload) {
+    if ([name isEqualToString:@"response.output_text.delta"] ||
+        [name isEqualToString:@"response.function_call_arguments.delta"]) {
+        id delta = payload[@"delta"];
+        return [delta isKindOfClass:NSString.class] && [delta length] > 0;
+    }
+    id item = payload[@"item"];
+    return [name isEqualToString:@"response.output_item.added"] &&
+        [item isKindOfClass:NSDictionary.class] && [item[@"type"] isEqual:@"function_call"];
+}
+
+/// Mutable response state stays behind this receiver's lock. No completion
+/// block retains it, and cancelled attempts cannot continue calling onEvent.
 @interface RelayStreamReceiver : NSObject <RelayStreamSink>
 @property (nonatomic, strong) NSMutableData *buffer;
 @property (nonatomic, copy) BOOL (^onEvent)(NSString *, NSDictionary *);
-@property (nonatomic, copy) void (^onFinish)(NSInteger status, NSString *remaining, NSError *error);
+@property (nonatomic, strong) dispatch_semaphore_t progress;
 @property (nonatomic) NSInteger statusCode;
 @property (nonatomic) BOOL stopRequested;
+@property (nonatomic) BOOL finished;
+@property (nonatomic) BOOL sawContent;
+@property (nonatomic) BOOL sawEvent;
+@property (nonatomic) BOOL completedResponse;
+@property (nonatomic) NSTimeInterval lastContentAt;
+@property (nonatomic, strong) NSError *completionError;
+@property (nonatomic, copy) NSString *streamError;
 @end
 
 @implementation RelayStreamReceiver
@@ -1114,47 +1189,78 @@ static NSURLSession *RelaySharedStreamSession(void) {
     self = [super init];
     if (self) {
         _buffer = [NSMutableData data];
-        _statusCode = 0;
+        _progress = dispatch_semaphore_create(0);
     }
     return self;
 }
 
 - (void)relayStreamStatus:(NSInteger)status {
-    self.statusCode = status;
+    @synchronized(self) {
+        if (self.stopRequested || self.finished) return;
+        self.statusCode = status;
+        dispatch_semaphore_signal(self.progress);
+    }
+}
+
+- (BOOL)dispatchEvent:(NSString *)name payload:(NSDictionary *)payload {
+    self.sawEvent = YES;
+    if ([name isEqualToString:@"response.completed"]) self.completedResponse = YES;
+    if ([name isEqualToString:@"response.failed"] ||
+        [name isEqualToString:@"response.incomplete"] || [name isEqualToString:@"error"]) {
+        self.streamError = RelayResponseErrorText(payload) ?: @"upstream stream failed or was incomplete";
+        return NO;
+    }
+    if (RelayStreamEventHasContent(name, payload)) {
+        BOOL first = !self.sawContent;
+        self.sawContent = YES;
+        self.lastContentAt = NSProcessInfo.processInfo.systemUptime;
+        if (first) dispatch_semaphore_signal(self.progress);
+    }
+    BOOL keepGoing = self.onEvent ? self.onEvent(name, payload) : YES;
+    return keepGoing && !self.completedResponse;
 }
 
 - (void)relayStreamData:(NSData *)data task:(NSURLSessionDataTask *)task {
-    if (self.stopRequested || task == nil) return;
-    if (data.length > 8 * 1024 * 1024 || self.buffer.length > 8 * 1024 * 1024 - data.length) {
-        [self.buffer setLength:0];
-        self.stopRequested = YES;
-        [task cancel];
-        return;
-    }
-    if (self.statusCode < 200 || self.statusCode >= 300) {
-        [self.buffer appendData:data];   // keep the error body for classification
-        return;
-    }
-    if (!RelayFeedSSEBuffer(self.buffer, data, self.onEvent)) {
-        self.stopRequested = YES;
-        [task cancel];
+    @synchronized(self) {
+        if (self.stopRequested || self.finished || !task) return;
+        const NSUInteger limit = 8 * 1024 * 1024;
+        if (data.length > limit || self.buffer.length > limit - data.length) {
+            self.streamError = @"upstream event or error body exceeded 8 MiB";
+            self.stopRequested = YES;
+            [task cancel];
+            return;
+        }
+        if (self.statusCode < 200 || self.statusCode >= 300) {
+            [self.buffer appendData:data];
+            return;
+        }
+        if (!RelayFeedSSEBuffer(self.buffer, data, ^BOOL(NSString *name, NSDictionary *payload) {
+            return [self dispatchEvent:name payload:payload];
+        })) {
+            self.stopRequested = YES;
+            [task cancel];
+        }
     }
 }
 
 - (void)relayStreamComplete:(NSError *)error {
-    if (!self.stopRequested && self.statusCode >= 200 && self.statusCode < 300 &&
-        self.buffer.length > 0) {
-        NSString *tail = [[NSString alloc] initWithData:self.buffer encoding:NSUTF8StringEncoding];
-        if ([tail hasPrefix:@"event:"] || [tail hasPrefix:@"data:"]) {
-            NSData *ending = [@"\n\n" dataUsingEncoding:NSUTF8StringEncoding];
-            if (!RelayFeedSSEBuffer(self.buffer, ending, self.onEvent)) self.stopRequested = YES;
+    @synchronized(self) {
+        if (self.finished) return;
+        if (!self.stopRequested && self.statusCode >= 200 && self.statusCode < 300 &&
+            self.buffer.length > 0) {
+            NSString *tail = [[NSString alloc] initWithData:self.buffer encoding:NSUTF8StringEncoding];
+            if ([tail hasPrefix:@"event:"] || [tail hasPrefix:@"data:"]) {
+                RelayFeedSSEBuffer(self.buffer, [@"\n\n" dataUsingEncoding:NSUTF8StringEncoding],
+                    ^BOOL(NSString *name, NSDictionary *payload) {
+                        return [self dispatchEvent:name payload:payload];
+                    });
+            }
         }
+        self.completionError = error;
+        self.onEvent = nil;
+        self.finished = YES;
+        dispatch_semaphore_signal(self.progress);
     }
-    NSString *remaining = [[NSString alloc] initWithData:self.buffer encoding:NSUTF8StringEncoding];
-    void (^finish)(NSInteger, NSString *, NSError *) = self.onFinish;
-    self.onFinish = nil;
-    self.onEvent = nil;
-    if (finish) finish(self.statusCode, remaining, error);
 }
 
 @end
@@ -1163,7 +1269,6 @@ static NSURLSession *RelaySharedStreamSession(void) {
 /// never rides the connection that just hung.
 static NSURLSession *RelayFreshStreamSession(RelayStreamHub **outHub) {
     RelayStreamHub *hub = [RelayStreamHub new];
-    hub.sinks = [NSMutableDictionary dictionary];
     NSURLSessionConfiguration *configuration =
         [NSURLSessionConfiguration ephemeralSessionConfiguration];
     configuration.timeoutIntervalForRequest = 240;
@@ -1177,20 +1282,21 @@ static NSURLSession *RelayFreshStreamSession(RelayStreamHub **outHub) {
                                    delegateQueue:nil];
 }
 
-/// Streaming POST to /v1/responses (adds stream:true) over the given session.
-/// onEvent receives each parsed SSE event; the leftover (non-SSE) body, if any,
-/// comes back in *outRemaining. Returns YES unless the HTTP call itself failed.
-/// *outStalled is set when the upstream sent nothing at all within
-/// kFirstResponseSeconds, which the caller retries on a fresh connection.
+/// Streaming POST with independent header / useful-content / idle budgets.
+/// A retry is safe only before any text or tool-call event has been delivered.
 static BOOL RelayStreamUpstream(NSString *apiKey, NSDictionary *baseBody,
                                 NSURLSession *session, RelayStreamHub *hub,
+                                NSUInteger attempt,
                                 BOOL (^onEvent)(NSString *, NSDictionary *),
                                 NSString **outRemaining, NSString **error,
                                 BOOL *outStalled) {
+    if (outRemaining) *outRemaining = nil;
+    if (error) *error = nil;
+    if (outStalled) *outStalled = NO;
     NSMutableDictionary *body = [baseBody mutableCopy];
     body[@"stream"] = @YES;
     NSData *send = [NSJSONSerialization dataWithJSONObject:body options:0 error:NULL];
-    if (send == nil) {
+    if (!send) {
         if (error) *error = @"could not encode upstream request";
         return NO;
     }
@@ -1203,67 +1309,101 @@ static BOOL RelayStreamUpstream(NSString *apiKey, NSDictionary *baseBody,
     [req setValue:@"Minis/1.0" forHTTPHeaderField:@"User-Agent"];
     req.HTTPBody = send;
 
-    __block BOOL ok = NO;
-    __block NSString *err = nil;
-    __block NSString *remaining = nil;
-    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-
-    RelayStreamReceiver *receiver = [[RelayStreamReceiver alloc] init];
+    RelayStreamLimits limits = RelayStreamLimitsForAttempt(attempt);
+    NSTimeInterval started = NSProcessInfo.processInfo.systemUptime;
+    RelayStreamReceiver *receiver = [RelayStreamReceiver new];
     receiver.onEvent = onEvent;
-    receiver.onFinish = ^(NSInteger status, NSString *rest, NSError *netErr) {
-        remaining = rest;
-        BOOL expectedCancel = receiver.stopRequested &&
-            [netErr.domain isEqualToString:NSURLErrorDomain] && netErr.code == NSURLErrorCancelled;
-        if (netErr != nil && !expectedCancel) {
-            err = netErr.localizedDescription ?: @"upstream stream failed";
-        } else if (status < 200 || status >= 300) {
-            id parsed = rest ? [NSJSONSerialization JSONObjectWithData:
-                [rest dataUsingEncoding:NSUTF8StringEncoding] options:0 error:NULL] : nil;
-            err = RelayResponseErrorText(parsed);
-            if (!err.length) {
-                NSString *safe = rest ?: @"";
-                if (safe.length > 400) safe = [safe substringToIndex:400];
-                err = [NSString stringWithFormat:@"upstream HTTP %ld: %@", (long)status, safe];
-            }
-        } else {
-            ok = YES;
-        }
-        dispatch_semaphore_signal(sem);
-    };
-
     NSURLSessionDataTask *task = [session dataTaskWithRequest:req];
-    hub.sinks[@(task.taskIdentifier)] = receiver;
+    [hub registerSink:receiver forTask:task];
     [task resume];
 
-    // Stage 1: wait for the response headers. A stall with nothing back at all
-    // is the pathological case, so the caller can retry immediately.
-    if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW,
-                (int64_t)(kFirstResponseSeconds * NSEC_PER_SEC))) != 0) {
-        if (receiver.statusCode == 0) {
+    NSString *timeoutReason = nil;
+    BOOL deadlineExpired = NO;
+    for (;;) {
+        NSTimeInterval next = started + limits.total;
+        @synchronized(receiver) {
+            if (receiver.finished) break;
+            NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
+            if (!receiver.statusCode) next = MIN(next, started + limits.headers);
+            if (!receiver.sawContent) next = MIN(next, started + limits.firstContent);
+            else next = MIN(next, receiver.lastContentAt + limits.idleContent);
+            if (now >= next) {
+                if (!receiver.statusCode) timeoutReason = @"upstream response headers timed out";
+                else if (!receiver.sawContent) timeoutReason = @"upstream first content timed out";
+                else if (now - started >= limits.total) timeoutReason = @"upstream total time limit exceeded";
+                else timeoutReason = @"upstream content stalled after output started";
+                deadlineExpired = YES;
+                receiver.stopRequested = YES;
+                receiver.onEvent = nil;
+                receiver.finished = YES;
+                break;
+            }
+        }
+        NSTimeInterval wait = MAX(0.001, next - NSProcessInfo.processInfo.systemUptime);
+        dispatch_semaphore_wait(receiver.progress,
+            dispatch_time(DISPATCH_TIME_NOW, (int64_t)(wait * NSEC_PER_SEC)));
+    }
+
+    // Detach first, then take the receiver lock: any callback already holding
+    // it finishes before we clear onEvent, and a queued one sees finished=YES.
+    // The caller may reset its Anthropic attempt state only after this fence.
+    [hub removeTask:task];
+    @synchronized(receiver) {
+        BOOL finished = receiver.finished && !deadlineExpired;
+        BOOL hasContent = receiver.sawContent;
+        NSInteger status = receiver.statusCode;
+        NSString *rest = [[NSString alloc] initWithData:receiver.buffer encoding:NSUTF8StringEncoding];
+        NSError *netErr = receiver.completionError;
+        NSString *streamErr = receiver.streamError;
+        if (!finished) {
+            receiver.stopRequested = YES;
+            receiver.onEvent = nil;
+            receiver.finished = YES;
             [task cancel];
-            hub.sinks[@(task.taskIdentifier)] = nil;
-            if (outRemaining) *outRemaining = nil;
-            if (outStalled) *outStalled = YES;
-            if (error) *error = @"upstream did not respond";
+            BOOL retryableStatus = status == 0 || (status >= 200 && status < 300);
+            if (outStalled) *outStalled = !hasContent && retryableStatus;
+            if (error) *error = timeoutReason ?: @"upstream stream timed out";
+            os_log(RelayLog(), "relay stream attempt=%{public}lu timeout=%{public}s headers=%{public}ld content=%{public}d elapsed=%.2f",
+                   (unsigned long)(attempt + 1), (timeoutReason ?: @"unknown").UTF8String,
+                   (long)status, hasContent, NSProcessInfo.processInfo.systemUptime - started);
             return NO;
         }
-        // Headers already arrived: wait for the rest of the body.
-        if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW,
-                    (int64_t)((240.0 - kFirstResponseSeconds) * NSEC_PER_SEC))) != 0) {
-            [task cancel];
-            hub.sinks[@(task.taskIdentifier)] = nil;
-            if (outRemaining) *outRemaining = nil;
-            if (error) *error = @"upstream stream timed out";
+        if (outRemaining) *outRemaining = rest;
+        if (streamErr.length) {
+            if (error) *error = streamErr;
             return NO;
         }
+        BOOL expectedCancel = receiver.completedResponse && receiver.stopRequested &&
+            [netErr.domain isEqualToString:NSURLErrorDomain] && netErr.code == NSURLErrorCancelled;
+        if (netErr && !expectedCancel) {
+            if (error) *error = netErr.localizedDescription ?: @"upstream stream failed";
+            return NO;
+        }
+        if (status < 200 || status >= 300) {
+            id parsed = rest ? [NSJSONSerialization JSONObjectWithData:
+                [rest dataUsingEncoding:NSUTF8StringEncoding] options:0 error:NULL] : nil;
+            NSString *message = RelayResponseErrorText(parsed);
+            if (!message.length) message = [NSString stringWithFormat:@"upstream HTTP %ld", (long)status];
+            if (error) *error = message;
+            return NO;
+        }
+        if (!receiver.sawEvent) {
+            id parsed = rest ? [NSJSONSerialization JSONObjectWithData:
+                [rest dataUsingEncoding:NSUTF8StringEncoding] options:0 error:NULL] : nil;
+            NSString *message = RelayResponseErrorText(parsed);
+            if (message.length || ![parsed isKindOfClass:NSDictionary.class]) {
+                if (error) *error = message ?: @"upstream returned no valid response";
+                return NO;
+            }
+        } else if (!receiver.completedResponse) {
+            if (error) *error = @"upstream stream ended before response.completed";
+            return NO;
+        }
+        os_log(RelayLog(), "relay stream attempt=%{public}lu completed content=%{public}d elapsed=%.2f",
+               (unsigned long)(attempt + 1), hasContent,
+               NSProcessInfo.processInfo.systemUptime - started);
+        return YES;
     }
-    if (outRemaining) {
-        *outRemaining = remaining;
-    }
-    if (error) {
-        *error = err ?: (ok ? nil : @"upstream stream timed out");
-    }
-    return ok;
 }
 
 /// Streams one Anthropic /v1/messages request: headers + message_start go out
@@ -1433,9 +1573,9 @@ static void RelayHandleAnthropicStream(int fd, NSString *apiKey,
                 return YES;
             };
 
-            // Send it; if the gateway sends nothing at all within the first-
-            // response deadline, retry once on a brand-new connection. No event
-            // has fired at that point, so a retry cannot duplicate output.
+            // Sequential retry only: no parallel paid requests. Metadata and
+            // heartbeats do not reset the first-content deadline. After any
+            // text or tool call starts, a stall is an error, never a replay.
             NSURLSession *retrySession = nil;
             for (int hop = 0; hop < 2 && !ok; hop++) {
                 RelayStreamHub *hub = nil;
@@ -1450,14 +1590,23 @@ static void RelayHandleAnthropicStream(int fd, NSString *apiKey,
                 BOOL stalled = NO;
                 upstreamError = nil;
                 remaining = nil;
-                ok = RelayStreamUpstream(apiKey, upstream, session, hub, relayOnEvent,
-                                         &remaining, &upstreamError, &stalled);
-                if (!stalled) break;
-                os_log(RelayLog(), "relay upstream stalled before headers; retrying on a fresh connection");
+                ok = RelayStreamUpstream(apiKey, upstream, session, hub, (NSUInteger)hop,
+                                         relayOnEvent, &remaining, &upstreamError, &stalled);
+                if (!stalled || hop == 1) break;
+                // The cancellation fence guarantees no old delegate callback
+                // can append to these variables after we clear them.
+                [pending setString:@""];
+                released = NO;
+                blockIndex = -1;
+                anyTool = NO;
+                currentBlockOpen = NO;
+                currentBlockType = nil;
+                os_log(RelayLog(), "relay no useful output; retrying once on a fresh connection");
             }
             if (retrySession) [retrySession finishTasksAndInvalidate];
 
             if (!ok) {
+                stopCurrent();
                 RelaySendAnthropicEvent(fd, @"error", @{
                     @"type": @"error",
                     @"error": @{@"type": @"api_error", @"message": upstreamError ?: @"unknown error"},
@@ -1605,10 +1754,7 @@ static void RelayHandleAnthropic(int fd, NSDictionary *incoming, NSString *apiKe
         id toolChoice = RelayMapAnthropicToolChoice(incoming[@"tool_choice"]);
 
         NSUInteger forwardTurns = RelayEffectiveMaxTurns();
-        NSUInteger rescueTurns  = (NSUInteger)RelayPrefInt(@"relayRescueTurns", kRescueTurns);
-        if (forwardTurns < 1) forwardTurns = 1;
-        if (rescueTurns < 1) rescueTurns = 1;
-        if (rescueTurns > forwardTurns) rescueTurns = forwardTurns;
+        NSUInteger rescueTurns = RelayEffectiveRescueTurns(forwardTurns);
 
         NSUInteger caps[2] = { forwardTurns, rescueTurns };
 
