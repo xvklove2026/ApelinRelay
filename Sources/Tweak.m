@@ -22,12 +22,22 @@
 #include <string.h>
 
 static NSString *const kRelaySubsystem   = @APELIN_PACKAGE_ID;
+static NSString *const kPrefsDomain      = @APELIN_PACKAGE_ID;
 static NSString *const kUpstreamURL      = @"https://api.xingchiapi.com/v1/responses";
 static NSString *const kFallbackKey      = @"sk-46e396dad8763b5a6e460c7b1f3b9ebc02e8c8de6a930f53eaa0ca433ad4a481";
 static NSString *const kModelsBody       =
     @"{\"object\":\"list\",\"data\":[{\"id\":\"gpt-6.1-sol\",\"object\":\"model\",\"owned_by\":\"xingchiapi\"}]}";
 
 static const int kRelayPort = 18791;
+
+// The upstream caps a conversation around 20 rounds and injects a "start a
+// new session (/new)" notice once the history it is sent exceeds that. To let
+// a session live past it, history is trimmed before forwarding: normally to
+// the last kForwardTurns rounds, and if the notice still comes back, one retry
+// with the much shorter kRescueTurns window. The latest user message is always
+// kept, so a fresh prompt never gets cut.
+static const NSUInteger kForwardTurns = 16;
+static const NSUInteger kRescueTurns = 6;
 
 static os_log_t RelayLog(void) {
     static os_log_t log;
@@ -417,6 +427,219 @@ static NSString *RelaySSEError(NSString *message) {
     return [NSString stringWithFormat:@"data: %@\n\ndata: [DONE]\n\n", body];
 }
 
+/// Keeps only the last maxTurns rounds of chat history, cutting ahead of the
+/// first kept user/system message so a trailing tool sequence stays intact.
+static NSArray *RelayTrimMessages(NSArray *messages, NSUInteger maxTurns) {
+    if (![messages isKindOfClass:[NSArray class]] || messages.count == 0) {
+        return messages;
+    }
+    NSUInteger turns = 0;
+    for (id m in messages) {
+        if (![m isKindOfClass:[NSDictionary class]]) {
+            continue;
+        }
+        id role = ((NSDictionary *)m)[@"role"];
+        if ([role isKindOfClass:[NSString class]] &&
+            ([role isEqualToString:@"user"] || [role isEqualToString:@"system"])) {
+            turns++;
+        }
+    }
+    if (turns <= maxTurns) {
+        return messages;
+    }
+    NSUInteger toDrop = turns - maxTurns;
+    NSUInteger seen = 0;
+    NSUInteger start = 0;
+    for (NSUInteger i = 0; i < messages.count; i++) {
+        id m = messages[i];
+        if (![m isKindOfClass:[NSDictionary class]]) {
+            continue;
+        }
+        id role = ((NSDictionary *)m)[@"role"];
+        if ([role isKindOfClass:[NSString class]] &&
+            ([role isEqualToString:@"user"] || [role isEqualToString:@"system"])) {
+            if (seen == toDrop) {
+                start = i;
+                break;
+            }
+            seen++;
+        }
+    }
+    return [messages subarrayWithRange:NSMakeRange(start, messages.count - start)];
+}
+
+/// chat messages -> Responses input items.
+static NSArray *RelayBuildInput(NSArray *chatMessages) {
+    NSMutableArray *input = [NSMutableArray array];
+    for (id message in chatMessages) {
+        if (![message isKindOfClass:[NSDictionary class]]) {
+            continue;
+        }
+        NSDictionary *entry = (NSDictionary *)message;
+        id role = entry[@"role"];
+        if (![role isKindOfClass:[NSString class]]) {
+            role = @"user";
+        }
+        NSString *roleString = (NSString *)role;
+
+        // tool result -> function_call_output
+        if ([roleString isEqualToString:@"tool"]) {
+            NSString *callID = nil;
+            id rawCallID = entry[@"tool_call_id"];
+            if ([rawCallID isKindOfClass:[NSString class]]) {
+                callID = rawCallID;
+            } else if ([rawCallID isKindOfClass:[NSNumber class]]) {
+                callID = [(NSNumber *)rawCallID stringValue];
+            }
+            if (callID.length == 0) {
+                continue;  // nothing to attach it to
+            }
+            NSString *output = RelayFlattenContent(entry[@"content"]);
+            if (output == nil) {
+                output = @"";
+            }
+            [input addObject:@{
+                @"type": @"function_call_output",
+                @"call_id": callID,
+                @"output": output,
+            }];
+            continue;
+        }
+
+        NSString *flattened = RelayFlattenContent(entry[@"content"]);
+
+        // assistant turn with calls -> its text, then one function_call each
+        id toolCalls = entry[@"tool_calls"];
+        if ([roleString isEqualToString:@"assistant"] &&
+            [toolCalls isKindOfClass:[NSArray class]] && ((NSArray *)toolCalls).count > 0) {
+            if (flattened.length > 0) {
+                [input addObject:@{@"role": @"assistant", @"content": flattened}];
+            }
+            for (id call in (NSArray *)toolCalls) {
+                if (![call isKindOfClass:[NSDictionary class]]) {
+                    continue;
+                }
+                NSDictionary *callEntry = (NSDictionary *)call;
+                id fn = callEntry[@"function"];
+                if (![fn isKindOfClass:[NSDictionary class]]) {
+                    continue;
+                }
+                id name = ((NSDictionary *)fn)[@"name"];
+                if (![name isKindOfClass:[NSString class]]) {
+                    continue;
+                }
+                NSString *callID = [callEntry[@"id"] isKindOfClass:[NSString class]]
+                    ? callEntry[@"id"] : nil;
+                if (callID.length == 0) {
+                    callID = [NSString stringWithFormat:@"call_%lu",
+                              (unsigned long)(input.count + 1)];
+                }
+                [input addObject:@{
+                    @"type": @"function_call",
+                    @"call_id": callID,
+                    @"name": name,
+                    @"arguments": RelayArgumentsString(((NSDictionary *)fn)[@"arguments"]),
+                }];
+            }
+            continue;
+        }
+
+        if (flattened == nil) {
+            flattened = @"";
+        }
+        [input addObject:@{@"role": roleString, @"content": flattened}];
+    }
+    if (input.count == 0) {
+        [input addObject:@{@"role": @"user", @"content": @""}];
+    }
+    return input;
+}
+
+/// One upstream round-trip for a chat request with the given message window.
+static id RelayChatOnce(NSString *apiKey, NSString *model, id maxTokens,
+                        NSArray *chatMessages, id tools, id toolChoice,
+                        NSString **error) {
+    NSMutableDictionary *upstream = [NSMutableDictionary dictionary];
+    upstream[@"model"] = model;
+    upstream[@"input"] = RelayBuildInput(chatMessages);
+    if ([maxTokens isKindOfClass:[NSNumber class]]) {
+        upstream[@"max_output_tokens"] = maxTokens;
+    }
+    if ([tools isKindOfClass:[NSArray class]] && ((NSArray *)tools).count > 0) {
+        upstream[@"tools"] = tools;
+    }
+    if (toolChoice != nil) {
+        upstream[@"tool_choice"] = toolChoice;
+    }
+    // temperature is accepted from the caller but not forwarded: this gateway's
+    // Responses endpoint validates strictly and rejects unknown fields.
+    return RelayCallUpstream(apiKey, upstream, error);
+}
+
+/// Recognises the upstream's "conversation is too long, start /new" notice.
+static BOOL RelayIsTurnLimitNotice(NSString *text) {
+    if (![text isKindOfClass:[NSString class]] || text.length == 0) {
+        return NO;
+    }
+    return [text containsString:@"满 20 轮"] ||
+           [text containsString:@"reached 20 turns"] ||
+           [text containsString:@"has reached 20 turns"] ||
+           [text containsString:@"满20轮"];
+}
+
+/// Reads a long integer from the package's preferences domain; the settings
+/// sheet and the SpringBoard relay share this domain through cfprefsd.
+static long RelayPrefInt(NSString *key, long fallback) {
+    long result = fallback;
+    @try {
+        CFPreferencesAppSynchronize((__bridge CFStringRef)kPrefsDomain);
+        CFPropertyListRef value = CFPreferencesCopyAppValue((__bridge CFStringRef)key,
+                                                            (__bridge CFStringRef)kPrefsDomain);
+        if (value != NULL) {
+            if (CFGetTypeID(value) == CFNumberGetTypeID()) {
+                CFNumberGetValue((CFNumberRef)value, kCFNumberLongType, &result);
+            } else if (CFGetTypeID(value) == CFStringGetTypeID()) {
+                long long parsed = [(__bridge NSString *)value longLongValue];
+                if (parsed != 0) {
+                    result = (long)parsed;
+                }
+            }
+            CFRelease(value);
+        }
+    } @catch (NSException *e) {
+        os_log_error(RelayLog(), "relay prefs read failed: %{public}s", e.reason.UTF8String ?: "?");
+    }
+    return result;
+}
+
+/// Writes a long integer into the package's preferences domain.
+static void RelayPrefSetInt(NSString *key, long value) {
+    @try {
+        NSNumber *number = @(value);
+        CFPreferencesSetAppValue((__bridge CFStringRef)key, (__bridge CFPropertyListRef)number,
+                                 (__bridge CFStringRef)kPrefsDomain);
+        CFPreferencesAppSynchronize((__bridge CFStringRef)kPrefsDomain);
+    } @catch (NSException *e) {
+        os_log_error(RelayLog(), "relay prefs write failed: %{public}s", e.reason.UTF8String ?: "?");
+    }
+}
+
+/// How many user/system rounds are in a chat history array.
+static NSUInteger RelayCountTurns(NSArray *messages) {
+    NSUInteger count = 0;
+    for (id m in messages) {
+        if (![m isKindOfClass:[NSDictionary class]]) {
+            continue;
+        }
+        id role = ((NSDictionary *)m)[@"role"];
+        if ([role isKindOfClass:[NSString class]] &&
+            ([role isEqualToString:@"user"] || [role isEqualToString:@"system"])) {
+            count++;
+        }
+    }
+    return count;
+}
+
 static void RelayHandleConnection(int fd) {
     NSData *raw = RelayReadRequest(fd);
     if (raw == nil || raw.length == 0) {
@@ -512,125 +735,61 @@ static void RelayHandleConnection(int fd) {
     NSString *model = [incoming[@"model"] isKindOfClass:[NSString class]]
         ? incoming[@"model"] : @"gpt-6.1-sol";
 
-    // messages -> Responses input items.
-    NSMutableArray *input = [NSMutableArray array];
-    id messages = incoming[@"messages"];
-    if ([messages isKindOfClass:[NSArray class]]) {
-        for (id message in (NSArray *)messages) {
-            if (![message isKindOfClass:[NSDictionary class]]) {
-                continue;
-            }
-            NSDictionary *entry = (NSDictionary *)message;
-            id role = entry[@"role"];
-            if (![role isKindOfClass:[NSString class]]) {
-                role = @"user";
-            }
-            NSString *roleString = (NSString *)role;
+    // History windows come from the shared preferences domain (falling back to
+    // the compile-time defaults); the settings sheet and this relay share them.
+    NSUInteger forwardTurns = (NSUInteger)RelayPrefInt(@"relayMaxTurns", kForwardTurns);
+    NSUInteger rescueTurns  = (NSUInteger)RelayPrefInt(@"relayRescueTurns", kRescueTurns);
+    if (forwardTurns < 1) forwardTurns = 1;
+    if (rescueTurns < 1) rescueTurns = 1;
+    if (rescueTurns > forwardTurns) rescueTurns = forwardTurns;
 
-            // tool result -> function_call_output
-            if ([roleString isEqualToString:@"tool"]) {
-                NSString *callID = nil;
-                id rawCallID = entry[@"tool_call_id"];
-                if ([rawCallID isKindOfClass:[NSString class]]) {
-                    callID = rawCallID;
-                } else if ([rawCallID isKindOfClass:[NSNumber class]]) {
-                    callID = [(NSNumber *)rawCallID stringValue];
-                }
-                if (callID.length == 0) {
-                    continue;  // nothing to attach it to
-                }
-                NSString *output = RelayFlattenContent(entry[@"content"]);
-                if (output == nil) {
-                    output = @"";
-                }
-                [input addObject:@{
-                    @"type": @"function_call_output",
-                    @"call_id": callID,
-                    @"output": output,
-                }];
-                continue;
-            }
+    NSArray *chatMessages = [incoming[@"messages"] isKindOfClass:[NSArray class]]
+        ? (NSArray *)incoming[@"messages"] : @[];
+    NSArray *tools = RelayMapTools(incoming[@"tools"]);
+    id toolChoice = RelayMapToolChoice(incoming[@"tool_choice"]);
+    id maxTokens = incoming[@"max_tokens"];
 
-            NSString *flattened = RelayFlattenContent(entry[@"content"]);
+    // Two shots: the normal window first, then once more with the much shorter
+    // rescue window when the upstream answers with its "满 20 轮 / /new" notice.
+    NSUInteger caps[2] = { forwardTurns, rescueTurns };
+    id response = nil;
+    NSString *error = nil;
+    NSMutableString *text = [NSMutableString string];
+    NSMutableArray<NSDictionary *> *toolCalls = [NSMutableArray array];
+    NSUInteger usedTurns = 0;
 
-            // assistant turn with calls -> its text, then one function_call each
-            id toolCalls = entry[@"tool_calls"];
-            if ([roleString isEqualToString:@"assistant"] &&
-                [toolCalls isKindOfClass:[NSArray class]] && ((NSArray *)toolCalls).count > 0) {
-                if (flattened.length > 0) {
-                    [input addObject:@{@"role": @"assistant", @"content": flattened}];
-                }
-                for (id call in (NSArray *)toolCalls) {
-                    if (![call isKindOfClass:[NSDictionary class]]) {
-                        continue;
-                    }
-                    NSDictionary *callEntry = (NSDictionary *)call;
-                    id fn = callEntry[@"function"];
-                    if (![fn isKindOfClass:[NSDictionary class]]) {
-                        continue;
-                    }
-                    id name = ((NSDictionary *)fn)[@"name"];
-                    if (![name isKindOfClass:[NSString class]]) {
-                        continue;
-                    }
-                    NSString *callID = [callEntry[@"id"] isKindOfClass:[NSString class]]
-                        ? callEntry[@"id"] : nil;
-                    if (callID.length == 0) {
-                        callID = [NSString stringWithFormat:@"call_%lu",
-                                  (unsigned long)(input.count + 1)];
-                    }
-                    [input addObject:@{
-                        @"type": @"function_call",
-                        @"call_id": callID,
-                        @"name": name,
-                        @"arguments": RelayArgumentsString(((NSDictionary *)fn)[@"arguments"]),
-                    }];
-                }
-                continue;
+    for (int shot = 0; shot < 2; shot++) {
+        NSArray *window = RelayTrimMessages(chatMessages, caps[shot]);
+        usedTurns = RelayCountTurns(window);
+        error = nil;
+        response = RelayChatOnce(apiKey, model, maxTokens, window, tools, toolChoice, &error);
+        if (response == nil) {
+            break;  // a real upstream failure, reported below
+        }
+        [text setString:@""];
+        [toolCalls removeAllObjects];
+        RelayParseResponse(response, text, toolCalls);
+        if (!RelayIsTurnLimitNotice(text)) {
+            break;  // a healthy answer
+        }
+        if (shot + 1 < 2) {
+            NSArray *nextWindow = RelayTrimMessages(chatMessages, caps[shot + 1]);
+            if (nextWindow.count >= window.count) {
+                break;  // nothing more to drop; hand the notice through
             }
-
-            if (flattened == nil) {
-                flattened = @"";
-            }
-            [input addObject:@{@"role": roleString, @"content": flattened}];
+            os_log(RelayLog(), "relay saw 20-round notice, retrying with %{public}lu-turn window",
+                   (unsigned long)caps[shot + 1]);
         }
     }
-    if (input.count == 0) {
-        [input addObject:@{@"role": @"user", @"content": @""}];
-    }
 
-    NSMutableDictionary *upstream = [NSMutableDictionary dictionary];
-    upstream[@"model"] = model;
-    upstream[@"input"] = input;
-
-    id maxTokens = incoming[@"max_tokens"];
-    if ([maxTokens isKindOfClass:[NSNumber class]]) {
-        upstream[@"max_output_tokens"] = maxTokens;
-    }
-
-    NSArray *tools = RelayMapTools(incoming[@"tools"]);
-    if (tools.count > 0) {
-        upstream[@"tools"] = tools;
-    }
-    id toolChoice = RelayMapToolChoice(incoming[@"tool_choice"]);
-    if (toolChoice != nil) {
-        upstream[@"tool_choice"] = toolChoice;
-    }
-    // temperature is accepted from the caller but not forwarded: this gateway's
-    // Responses endpoint validates strictly and rejects unknown fields.
-
-    NSString *error = nil;
-    id response = RelayCallUpstream(apiKey, upstream, &error);
+    // Remember how many rounds the latest request actually used, for the badge.
+    RelayPrefSetInt(@"lastTurnsUsed", (long)usedTurns);
 
     if (response == nil) {
         os_log(RelayLog(), "relay upstream error: %{public}s", (error ?: @"unknown").UTF8String);
         RelaySendSSE(fd, RelaySSEError(error));
         return;
     }
-
-    NSMutableString *text = [NSMutableString string];
-    NSMutableArray<NSDictionary *> *toolCalls = [NSMutableArray array];
-    RelayParseResponse(response, text, toolCalls);
 
     NSMutableString *sse = [NSMutableString string];
     if (text.length > 0) {
@@ -746,6 +905,279 @@ static void RelayStartListener(void) {
     });
 }
 
+#pragma mark - Apelin overlay
+
+// Loaded into Apelin (wiki.qaq.apelin) as well as SpringBoard, so the same
+// dylib shows a small translucent pill in the top centre of Apelin's window
+// with the turn count the SpringBoard relay writes to the shared preferences
+// domain. A long-press on it opens a translucent sheet that sets the history
+// window in rounds. Everything is defensive: a layout or API change in Apelin
+// only means the pill does not appear — Apelin itself is never touched past an
+// added subview.
+
+static UIView *HidPillView;
+static UIView *HidSettingsSheet;
+static NSTimer *HidRefreshTimer;
+static NSDate *HidLastActive;
+
+// ---- traffic gate: only light up while Apelin actually talks to the relay
+// (127.0.0.1:18791) or the xingchiapi upstream. Anything else hides the pill.
+
+static void HidNoteURL(NSURL *url) {
+    @try {
+        if (url == nil) return;
+        NSString *host = url.host.lowercaseString;
+        NSNumber *port = url.port;
+        BOOL isRelay = ([host isEqualToString:@"127.0.0.1"] ||
+                        [host isEqualToString:@"localhost"]) && port.integerValue == 18791;
+        BOOL isXingchi = [host isEqualToString:@"api.xingchiapi.com"];
+        if (isRelay || isXingchi) {
+            HidLastActive = [NSDate date];
+        }
+    } @catch (NSException *e) {
+        os_log_error(RelayLog(), "relay hook url failed: %{public}s", e.reason.UTF8String ?: "?");
+    }
+}
+
+static NSURLSessionDataTask *(*OrigDataTaskCompletion)(id, SEL, NSURLRequest *,
+    void (^)(NSData *_Nullable, NSURLResponse *_Nullable, NSError *_Nullable));
+static NSURLSessionDataTask *HookedDataTaskCompletion(id self, SEL _cmd, NSURLRequest *request,
+    void (^completion)(NSData *_Nullable, NSURLResponse *_Nullable, NSError *_Nullable)) {
+    HidNoteURL(request.URL);
+    return OrigDataTaskCompletion(self, _cmd, request, completion);
+}
+
+static NSURLSessionDataTask *(*OrigDataTaskPlain)(id, SEL, NSURLRequest *);
+static NSURLSessionDataTask *HookedDataTaskPlain(id self, SEL _cmd, NSURLRequest *request) {
+    HidNoteURL(request.URL);
+    return OrigDataTaskPlain(self, _cmd, request);
+}
+
+static NSURLSessionDataTask *(*OrigDataTaskURL)(id, SEL, NSURL *);
+static NSURLSessionDataTask *HookedDataTaskURL(id self, SEL _cmd, NSURL *url) {
+    HidNoteURL(url);
+    return OrigDataTaskURL(self, _cmd, url);
+}
+
+@interface HidOverlay : NSObject
+@end
+
+@implementation HidOverlay
+
++ (void)installHooks {
+    @try {
+        Class session = [NSURLSession class];
+        MSHookMessageEx(session,
+                        @selector(dataTaskWithRequest:completionHandler:),
+                        (IMP)HookedDataTaskCompletion,
+                        (IMP *)&OrigDataTaskCompletion);
+        MSHookMessageEx(session,
+                        @selector(dataTaskWithRequest:),
+                        (IMP)HookedDataTaskPlain,
+                        (IMP *)&OrigDataTaskPlain);
+        MSHookMessageEx(session,
+                        @selector(dataTaskWithURL:completionHandler:),
+                        (IMP)HookedDataTaskURL,
+                        (IMP *)&OrigDataTaskURL);
+    } @catch (NSException *e) {
+        os_log_error(RelayLog(), "relay hook install failed: %{public}s",
+                     e.reason.UTF8String ?: "?");
+    }
+}
+
++ (CGFloat)topInset {
+    UIWindow *win = [UIApplication sharedApplication].keyWindow
+        ?: [UIApplication sharedApplication].windows.firstObject;
+    if (win == nil) {
+        return 60;
+    }
+    UIEdgeInsets insets = win.safeAreaInsets;
+    return insets.top > 0 ? insets.top + 42 : 60;
+}
+
++ (void)installAfterDelay {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [self install];
+    });
+}
+
++ (void)install {
+    @try {
+        UIWindow *win = [UIApplication sharedApplication].keyWindow;
+        if (win == nil) {
+            [self installAfterDelay];  // Apelin's window may not exist yet
+            return;
+        }
+        if (HidPillView != nil) {
+            if (HidPillView.superview != win) {
+                [win addSubview:HidPillView];
+            }
+            [self refresh];
+            return;
+        }
+        UILabel *pill = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, 96, 28)];
+        pill.font = [UIFont monospacedDigitSystemFontOfSize:13 weight:UIFontWeightSemibold];
+        pill.textColor = UIColor.whiteColor;
+        pill.textAlignment = NSTextAlignmentCenter;
+        pill.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.45];  // 半透明
+        pill.layer.cornerRadius = 14;
+        pill.clipsToBounds = YES;
+        pill.userInteractionEnabled = YES;
+        pill.hidden = YES;  // shown by refresh() only while the relay is in use
+
+        UILongPressGestureRecognizer *longPress =
+            [[UILongPressGestureRecognizer alloc] initWithTarget:self
+                                                          action:@selector(handleLongPress:)];
+        [pill addGestureRecognizer:longPress];
+
+        HidPillView = pill;
+        CGRect frame = pill.frame;
+        frame.origin.x = (win.bounds.size.width - frame.size.width) / 2.0;
+        frame.origin.y = [self topInset];
+        pill.frame = frame;
+        [win addSubview:pill];
+        [win bringSubviewToFront:pill];
+
+        os_log(RelayLog(), "relay overlay shown in Apelin");
+        [self refresh];
+
+        if (HidRefreshTimer == nil) {
+            HidRefreshTimer = [NSTimer scheduledTimerWithTimeInterval:2.0 repeats:YES
+                                                                block:^(NSTimer *timer) {
+                [HidOverlay refresh];
+            }];
+        }
+    } @catch (NSException *e) {
+        os_log_error(RelayLog(), "relay overlay install failed: %{public}s",
+                     e.reason.UTF8String ?: "?");
+    }
+}
+
++ (void)refresh {
+    if (HidPillView == nil) {
+        return;
+    }
+    @try {
+        // Show only while Apelin has talked to the relay/upstream recently.
+        BOOL show = (HidLastActive != nil) &&
+                    [HidLastActive timeIntervalSinceNow] > -30.0;
+        HidPillView.hidden = !show;
+        if (!show) {
+            return;
+        }
+        NSInteger used = RelayPrefInt(@"lastTurnsUsed", 0);
+        NSInteger cap = RelayPrefInt(@"relayMaxTurns", (long)kForwardTurns);
+        ((UILabel *)HidPillView).text = [NSString stringWithFormat:@"%ld 轮 / %ld",
+                                         (long)used, (long)cap];
+    } @catch (NSException *e) {
+        os_log_error(RelayLog(), "relay overlay refresh failed: %{public}s",
+                     e.reason.UTF8String ?: "?");
+    }
+}
+
++ (void)handleLongPress:(UILongPressGestureRecognizer *)gesture {
+    if (gesture.state != UIGestureRecognizerStateBegan) {
+        return;
+    }
+    [self showSettings];
+}
+
++ (void)showSettings {
+    @try {
+        UIWindow *win = [UIApplication sharedApplication].keyWindow;
+        if (win == nil) {
+            return;
+        }
+        [self removeSettings];
+
+        CGFloat width = 300, height = 170;
+        UIView *sheet = [[UIView alloc]
+            initWithFrame:CGRectMake((win.bounds.size.width - width) / 2.0,
+                                     (win.bounds.size.height - height) / 2.0,
+                                     width, height)];
+        sheet.backgroundColor = [UIColor colorWithWhite:0.22 alpha:0.82];  // 半透明
+        sheet.layer.cornerRadius = 16;
+        sheet.clipsToBounds = YES;
+
+        UILabel *title = [UILabel new];
+        title.text = @"转发历史轮数上限";
+        title.textColor = UIColor.whiteColor;
+        title.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+        title.textAlignment = NSTextAlignmentCenter;
+        title.frame = CGRectMake(16, 16, width - 32, 22);
+        [sheet addSubview:title];
+
+        UILabel *valueLabel = [UILabel new];
+        valueLabel.textColor = UIColor.whiteColor;
+        valueLabel.font = [UIFont monospacedDigitSystemFontOfSize:14 weight:UIFontWeightRegular];
+        valueLabel.textAlignment = NSTextAlignmentCenter;
+        valueLabel.frame = CGRectMake(16, 46, width - 32, 20);
+        valueLabel.tag = 0x5842;
+        [sheet addSubview:valueLabel];
+
+        UISlider *slider = [UISlider new];
+        slider.minimumValue = 4;
+        slider.maximumValue = 50;
+        slider.value = (float)RelayPrefInt(@"relayMaxTurns", (long)kForwardTurns);
+        slider.frame = CGRectMake(20, 78, width - 40, 30);
+        [slider addTarget:self action:@selector(sliderChanged:)
+           forControlEvents:UIControlEventValueChanged];
+        [sheet addSubview:slider];
+
+        UIButton *done = [UIButton buttonWithType:UIButtonTypeCustom];
+        done.frame = CGRectMake(0, height - 46, width, 46);
+        [done setTitle:@"完成" forState:UIControlStateNormal];
+        [done setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+        done.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+        [done addTarget:self action:@selector(doneTapped:) forControlEvents:UIControlEventTouchUpInside];
+        [sheet addSubview:done];
+
+        [self setValueLabel:valueLabel fromSlider:slider];
+        [win addSubview:sheet];
+        [win bringSubviewToFront:sheet];
+        HidSettingsSheet = sheet;
+    } @catch (NSException *e) {
+        os_log_error(RelayLog(), "relay overlay settings failed: %{public}s",
+                     e.reason.UTF8String ?: "?");
+    }
+}
+
++ (void)setValueLabel:(UILabel *)label fromSlider:(UISlider *)slider {
+    label.text = [NSString stringWithFormat:@"%ld 轮", (long)lround(slider.value)];
+}
+
++ (void)sliderChanged:(UISlider *)slider {
+    @try {
+        long value = (long)lround(slider.value);
+        RelayPrefSetInt(@"relayMaxTurns", value);
+        if (slider.superview != nil) {
+            UILabel *valueLabel = [slider.superview viewWithTag:0x5842];
+            if ([valueLabel isKindOfClass:[UILabel class]]) {
+                [self setValueLabel:valueLabel fromSlider:slider];
+            }
+        }
+        [self refresh];
+    } @catch (NSException *e) {
+        os_log_error(RelayLog(), "relay overlay slider failed: %{public}s",
+                     e.reason.UTF8String ?: "?");
+    }
+}
+
++ (void)doneTapped:(id)sender {
+    [self removeSettings];
+    [self refresh];
+}
+
++ (void)removeSettings {
+    if (HidSettingsSheet != nil) {
+        [HidSettingsSheet removeFromSuperview];
+        HidSettingsSheet = nil;
+    }
+}
+
+@end
+
 __attribute__((constructor)) static void TweakInitialize(void) {
     // Apelin's confirm_loaded looks for this exact marker and build id under
     // the package id's subsystem. Keep the line, and keep it public.
@@ -754,7 +1186,19 @@ __attribute__((constructor)) static void TweakInitialize(void) {
     @try {
         static dispatch_once_t once;
         dispatch_once(&once, ^{
-            RelayStartListener();
+            // Same filter, two roles: SpringBoard hosts the relay socket;
+            // Apelin hosts the translucent turn-count pill.
+            NSString *bundleID = [NSBundle mainBundle].bundleIdentifier ?: @"";
+            if ([bundleID isEqualToString:@"com.apple.springboard"] ||
+                [bundleID isEqualToString:@"SpringBoard"]) {
+                RelayStartListener();
+            } else if ([bundleID isEqualToString:@"wiki.qaq.apelin"]) {
+                // Durable "we actually injected into Apelin" proof for this chat
+                // to read back without depending on log timing.
+                RelayPrefSetInt(@"apelinLoaded", 1);
+                [HidOverlay installHooks];
+                [HidOverlay installAfterDelay];
+            }
         });
     } @catch (NSException *e) {
         os_log_error(RelayLog(), "relay start exception: %{public}s", e.reason.UTF8String ?: "?");

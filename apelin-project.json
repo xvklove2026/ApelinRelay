@@ -122,7 +122,8 @@
     "tweakFilter": {
       "dylib": "tweak",
       "bundles": [
-        "com.apple.springboard"
+        "com.apple.springboard",
+        "wiki.qaq.apelin"
       ]
     }
   }
