@@ -140,6 +140,17 @@ static void CompleteText(int fd, NSString *text, BOOL split) {
         }
         CompleteText(fd, @"STALE_MUST_NOT_APPEAR", NO); return;
     }
+    if ([s isEqual:@"active-after-output"]) {
+        WriteData(fd, Frame(@"response.output_text.delta", @{@"delta": @"PREFIX"}));
+        NSTimeInterval until = NSProcessInfo.processInfo.systemUptime +
+            RelayStreamLimitsForAttempt(0).idleContent + 0.4;
+        while (NSProcessInfo.processInfo.systemUptime < until) {
+            WriteString(fd, @": heartbeat\n\n");
+            usleep(100000);
+        }
+        CompleteText(fd, @"OK", NO);
+        return;
+    }
     if ([s isEqual:@"both-stall"]) { usleep(3100000); return; }
     if ([s isEqual:@"retry-grace"] && index == 1) {
         usleep((useconds_t)((RelayStreamLimitsForAttempt(0).firstContent + 0.2) * 1000000.0));
@@ -301,7 +312,7 @@ int main(int argc, const char *argv[]) {
         NSArray *scenarios = argc > 1 ? @[[NSString stringWithUTF8String:argv[1]]] :
             @[@"normal", @"split", @"header-stall", @"body-stall", @"heartbeat",
               @"retry-grace", @"both-stall", @"late-normal", @"partial-idle", @"tool", @"tool-idle",
-              @"missing-end", @"http-error", @"event-error", @"json", @"notice", @"completed-open"];
+              @"missing-end", @"http-error", @"event-error", @"json", @"notice", @"completed-open", @"active-after-output"];
         for (NSString *scenario in scenarios) {
             NSDictionary *result = Run(scenario);
             printf("CASE %s attempts=%lu elapsed=%.3fs\n", scenario.UTF8String,

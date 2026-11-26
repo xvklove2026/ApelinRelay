@@ -70,8 +70,8 @@ static RelayStreamLimits RelayStreamLimitsForAttempt(NSUInteger attempt) {
 #if defined(APELIN_RELAY_TESTING) && defined(APELIN_RELAY_TEST_TIMEOUT_SCALE)
     scale = APELIN_RELAY_TEST_TIMEOUT_SCALE;
 #endif
-    return (RelayStreamLimits){(attempt ? 90.0 : 45.0) * scale,
-                               (attempt ? 90.0 : 45.0) * scale,
+    return (RelayStreamLimits){(attempt ? 90.0 : 15.0) * scale,
+                               (attempt ? 90.0 : 20.0) * scale,
                                120.0 * scale, 900.0 * scale};
 }
 
@@ -1228,7 +1228,7 @@ static NSURLSession *RelaySharedStreamSession(void) {
         NSURLSessionConfiguration *configuration =
             [NSURLSessionConfiguration defaultSessionConfiguration];
         configuration.timeoutIntervalForRequest = 240;
-        configuration.timeoutIntervalForResource = 240;
+        configuration.timeoutIntervalForResource = 900;
         configuration.HTTPMaximumConnectionsPerHost = 8;
         configuration.waitsForConnectivity = NO;
         configuration.requestCachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
@@ -1264,6 +1264,7 @@ static BOOL RelayStreamEventHasContent(NSString *name, NSDictionary *payload) {
 @property (nonatomic) BOOL sawEvent;
 @property (nonatomic) BOOL completedResponse;
 @property (nonatomic) NSTimeInterval lastContentAt;
+@property (nonatomic) NSTimeInterval lastActivityAt;
 @property (nonatomic, strong) NSError *completionError;
 @property (nonatomic, copy) NSString *streamError;
 @end
@@ -1308,6 +1309,7 @@ static BOOL RelayStreamEventHasContent(NSString *name, NSDictionary *payload) {
 - (void)relayStreamData:(NSData *)data task:(NSURLSessionDataTask *)task {
     @synchronized(self) {
         if (self.stopRequested || self.finished || !task) return;
+        if (data.length) self.lastActivityAt = NSProcessInfo.processInfo.systemUptime;
         const NSUInteger limit = 8 * 1024 * 1024;
         if (data.length > limit || self.buffer.length > limit - data.length) {
             self.streamError = @"upstream event or error body exceeded 8 MiB";
@@ -1357,7 +1359,7 @@ static NSURLSession *RelayFreshStreamSession(RelayStreamHub **outHub) {
     NSURLSessionConfiguration *configuration =
         [NSURLSessionConfiguration ephemeralSessionConfiguration];
     configuration.timeoutIntervalForRequest = 240;
-    configuration.timeoutIntervalForResource = 240;
+    configuration.timeoutIntervalForResource = 900;
     configuration.HTTPMaximumConnectionsPerHost = 8;
     configuration.waitsForConnectivity = NO;
     configuration.requestCachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
@@ -1418,7 +1420,7 @@ static BOOL RelayStreamUpstream(NSString *apiKey, NSDictionary *baseBody,
             NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
             if (!receiver.statusCode) next = MIN(next, started + limits.headers);
             if (!receiver.sawContent) next = MIN(next, started + limits.firstContent);
-            else next = MIN(next, receiver.lastContentAt + limits.idleContent);
+            else next = MIN(next, MAX(receiver.lastContentAt, receiver.lastActivityAt) + limits.idleContent);
             if (now >= next) {
                 if (!receiver.statusCode) timeoutReason = @"upstream response headers timed out";
                 else if (!receiver.sawContent) timeoutReason = @"upstream first content timed out";
