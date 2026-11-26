@@ -1541,7 +1541,10 @@ static void RelayHandleAnthropicStream(int fd, NSString *apiKey,
                         if ([delta isKindOfClass:[NSString class]] && ((NSString *)delta).length > 0) {
                             if (!released) {
                                 [pending appendString:delta];
-                                if (pending.length > 512 || !RelayMayBeTurnLimitNoticePrefix(pending)) {
+                                // Cap how long ordinary text can be held: a real
+                                // notice is far shorter than this, so a longer
+                                // buffer would only delay the first token.
+                                if (pending.length > 32 || !RelayMayBeTurnLimitNoticePrefix(pending)) {
                                     released = YES;
                                     flushPending();
                                 }
@@ -1732,6 +1735,138 @@ static void RelayHandleAnthropicStream(int fd, NSString *apiKey,
         RelayPrefSetInt(@"lastRelayUse", (long)[[NSDate date] timeIntervalSince1970]);
     } @catch (NSException *e) {
         os_log_error(RelayLog(), "relay anthropic stream failed: %{public}s",
+                     e.reason.UTF8String ?: "?");
+    }
+}
+
+/// Writes an already-framed SSE string to the client.
+static void RelaySendSSEString(int fd, NSString *text) {
+    if (text.length == 0) return;
+    NSData *data = [text dataUsingEncoding:NSUTF8StringEncoding];
+    RelayWriteAll(fd, data.bytes, data.length);
+}
+
+/// Streams one OpenAI-compatible chat/completions request. The upstream already
+/// speaks Responses over SSE, so each event becomes a chat.completion.chunk and
+/// the client renders tokens as they arrive, exactly as a native streaming
+/// client does — instead of waiting for the whole answer.
+static void RelayHandleChatStream(int fd, NSString *apiKey, NSString *model,
+                                  NSArray *fullMessages, id tools, id toolChoice,
+                                  id maxTokens, NSUInteger forwardTurns) {
+    @try {
+        RelaySendSSEHeader(fd);
+        RelaySendSSEString(fd, RelayMakeChunk(model,
+            @{@"role": @"assistant", @"content": @""}, nil));
+
+        NSArray *window = RelayTrimMessages(fullMessages, forwardTurns);
+        NSMutableDictionary *upstream = [NSMutableDictionary dictionary];
+        upstream[@"model"] = model;
+        upstream[@"input"] = RelayBuildInput(window);
+        if ([maxTokens isKindOfClass:[NSNumber class]]) {
+            upstream[@"max_output_tokens"] = maxTokens;
+        }
+        if ([tools isKindOfClass:[NSArray class]] && ((NSArray *)tools).count > 0) {
+            upstream[@"tools"] = tools;
+        }
+        if (toolChoice != nil) {
+            upstream[@"tool_choice"] = toolChoice;
+        }
+
+        __block NSInteger toolIndex = -1;
+        __block BOOL anyTool = NO;
+        __block BOOL finished = NO;
+
+        // No notice buffering here: passthrough is the whole point, so the very
+        // first generated token reaches the client immediately.
+        BOOL (^onEvent)(NSString *, NSDictionary *) = ^BOOL(NSString *name, NSDictionary *payload) {
+            @try {
+                if ([name isEqualToString:@"response.output_item.added"]) {
+                    id item = payload[@"item"];
+                    if ([item isKindOfClass:[NSDictionary class]] &&
+                        [((NSDictionary *)item)[@"type"] isEqual:@"function_call"]) {
+                        toolIndex++;
+                        anyTool = YES;
+                        NSString *callID = [((NSDictionary *)item)[@"call_id"] isKindOfClass:[NSString class]]
+                            ? ((NSDictionary *)item)[@"call_id"] : @"";
+                        NSString *fnName = [((NSDictionary *)item)[@"name"] isKindOfClass:[NSString class]]
+                            ? ((NSDictionary *)item)[@"name"] : @"";
+                        RelaySendSSEString(fd, RelayMakeChunk(model, @{@"tool_calls": @[@{
+                            @"index": @(toolIndex),
+                            @"id": callID,
+                            @"type": @"function",
+                            @"function": @{@"name": fnName, @"arguments": @""},
+                        }]}, nil));
+                    }
+                } else if ([name isEqualToString:@"response.output_text.delta"]) {
+                    id delta = payload[@"delta"];
+                    if ([delta isKindOfClass:[NSString class]] && ((NSString *)delta).length > 0) {
+                        RelaySendSSEString(fd, RelayMakeChunk(model, @{@"content": delta}, nil));
+                    }
+                } else if ([name isEqualToString:@"response.function_call_arguments.delta"]) {
+                    id delta = payload[@"delta"];
+                    if ([delta isKindOfClass:[NSString class]] && ((NSString *)delta).length > 0 &&
+                        toolIndex >= 0) {
+                        RelaySendSSEString(fd, RelayMakeChunk(model, @{@"tool_calls": @[@{
+                            @"index": @(toolIndex),
+                            @"function": @{@"arguments": delta},
+                        }]}, nil));
+                    }
+                } else if ([name isEqualToString:@"response.completed"]) {
+                    finished = YES;
+                }
+            } @catch (NSException *e) {
+                os_log_error(RelayLog(), "relay chat stream event failed: %{public}s",
+                             e.reason.UTF8String ?: "?");
+            }
+            return YES;
+        };
+
+        NSString *upstreamError = nil;
+        NSString *remaining = nil;
+        BOOL ok = NO;
+        NSURLSession *retrySession = nil;
+        for (int hop = 0; hop < 2 && !ok; hop++) {
+            RelayStreamHub *hub = nil;
+            NSURLSession *session = nil;
+            if (hop == 0) {
+                session = RelaySharedStreamSession();
+                hub = [RelayStreamHub shared];
+            } else {
+                session = RelayFreshStreamSession(&hub);
+                retrySession = session;
+            }
+            BOOL stalled = NO;
+            upstreamError = nil;
+            remaining = nil;
+            ok = RelayStreamUpstream(apiKey, upstream, session, hub, (NSUInteger)hop,
+                                     onEvent, &remaining, &upstreamError, &stalled);
+            if (!stalled || hop == 1) break;
+            // Nothing reached the client yet, so restarting the token stream is
+            // safe; a clean answer simply begins again on the new connection.
+            toolIndex = -1;
+            anyTool = NO;
+            finished = NO;
+            os_log(RelayLog(), "relay chat stream stalled before output; retrying once");
+        }
+        if (retrySession) [retrySession finishTasksAndInvalidate];
+
+        if (!ok) {
+            os_log(RelayLog(), "relay chat upstream error: %{public}s",
+                   (upstreamError ?: @"unknown").UTF8String);
+            RelaySendSSEString(fd, RelaySSEError(upstreamError));
+            return;
+        }
+        if (!anyTool && !finished) {
+            // The stream ended cleanly without a terminal event but produced no
+            // tool call: report a normal stop so the client does not hang.
+            RelaySendSSEString(fd, RelayMakeChunk(model, @{}, @"stop"));
+            RelaySendSSEString(fd, @"data: [DONE]\n\n");
+            return;
+        }
+        RelaySendSSEString(fd, RelayMakeChunk(model, @{}, anyTool ? @"tool_calls" : @"stop"));
+        RelaySendSSEString(fd, @"data: [DONE]\n\n");
+    } @catch (NSException *e) {
+        os_log_error(RelayLog(), "relay chat stream failed: %{public}s",
                      e.reason.UTF8String ?: "?");
     }
 }
@@ -1991,9 +2126,13 @@ static void RelayHandleConnection(int fd) {
         return;
     }
 
-    // Auth: caller's header if it came with one, otherwise the fallback key.
+    // Auth: either header a client uses. Apelin's Anthropic slot may send
+    // x-api-key rather than Authorization; reading only one of them silently
+    // fell back to the built-in key, which routed the request to a different
+    // quota than the native client used.
     NSString *apiKey = kFallbackKey;
     NSString *auth = headers[@"authorization"];
+    if (auth.length == 0) auth = headers[@"x-api-key"];
     if (auth.length > 0) {
         NSString *trimmed = [auth stringByTrimmingCharactersInSet:
                              [NSCharacterSet whitespaceCharacterSet]];
@@ -2039,6 +2178,19 @@ static void RelayHandleConnection(int fd) {
     NSArray *tools = RelayMapTools(incoming[@"tools"]);
     id toolChoice = RelayMapToolChoice(incoming[@"tool_choice"]);
     id maxTokens = incoming[@"max_tokens"];
+
+    // Stream when the client asks for it, the same way the native client does:
+    // the answer then appears token by token instead of after full generation.
+    BOOL chatStream = [incoming[@"stream"] isKindOfClass:[NSNumber class]]
+        ? [incoming[@"stream"] boolValue]
+        : ([incoming[@"stream"] isKindOfClass:[NSString class]] &&
+           [incoming[@"stream"] boolValue]);
+    if (chatStream) {
+        RelayPrefSetInt(@"lastRelayUse", (long)[[NSDate date] timeIntervalSince1970]);
+        RelayHandleChatStream(fd, apiKey, model, chatMessages, tools, toolChoice,
+                             maxTokens, forwardTurns);
+        return;
+    }
 
     // Two shots: the normal window first, then once more with the much shorter
     // rescue window when the upstream answers with its "满 20 轮 / /new" notice.
