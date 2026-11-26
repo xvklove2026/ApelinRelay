@@ -66,6 +66,7 @@ static RelayStreamLimits RelayStreamLimitsForAttempt(NSUInteger attempt) {
 }
 
 static long RelayPrefInt(NSString *key, long fallback);
+static void RelayApplyReasoning(NSMutableDictionary *upstream);
 static NSString *RelayResponseErrorText(id payload);
 
 static NSUInteger RelayEffectiveMaxTurns(void) {
@@ -201,7 +202,9 @@ static NSData *RelayReadRequest(int fd) {
 /// a human readable reason in *outError.
 static id RelayCallUpstream(NSString *apiKey, NSDictionary *requestBody,
                             NSString **outError) {
-    NSData *sendBody = [NSJSONSerialization dataWithJSONObject:requestBody options:0 error:NULL];
+    NSMutableDictionary *body = [requestBody mutableCopy];
+    RelayApplyReasoning(body);
+    NSData *sendBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:NULL];
     if (sendBody == nil) {
         if (outError) *outError = @"could not encode upstream request";
         return nil;
@@ -727,6 +730,24 @@ static BOOL RelayMayBeTurnLimitNoticePrefix(NSString *text) {
         if ([head hasPrefix:key] || [key hasPrefix:head]) return YES;
     }
     return NO;
+}
+
+/// Reasoning effort sent upstream. The gateway's default effort is much slower
+/// on real conversations (measured 4.4-7.5s to first token with 8 rounds of
+/// history versus 2.6s at "low"), and a native client that feels fast is almost
+/// certainly not running at the default. 0 disables the field.
+static void RelayApplyReasoning(NSMutableDictionary *upstream) {
+    long level = RelayPrefInt(@"relayReasoningEffort", 2);
+    NSString *effort = nil;
+    switch (level) {
+        case 0: return;
+        case 1: effort = @"minimal"; break;
+        case 3: effort = @"medium"; break;
+        case 4: effort = @"high"; break;
+        case 2:
+        default: effort = @"low"; break;
+    }
+    upstream[@"reasoning"] = @{@"effort": effort};
 }
 
 static NSString *RelayResponseErrorText(id payload) {
@@ -1295,11 +1316,18 @@ static BOOL RelayStreamUpstream(NSString *apiKey, NSDictionary *baseBody,
     if (outStalled) *outStalled = NO;
     NSMutableDictionary *body = [baseBody mutableCopy];
     body[@"stream"] = @YES;
+    RelayApplyReasoning(body);
     NSData *send = [NSJSONSerialization dataWithJSONObject:body options:0 error:NULL];
     if (!send) {
         if (error) *error = @"could not encode upstream request";
         return NO;
     }
+
+    os_log(RelayLog(), "relay upstream body keys=%{public}s input_items=%{public}lu",
+           [[[body allKeys] sortedArrayUsingSelector:@selector(compare:)]
+               componentsJoinedByString:@","].UTF8String,
+           (unsigned long)[body[@"input"] isKindOfClass:[NSArray class]]
+               ? [(NSArray *)body[@"input"] count] : 0);
 
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:kUpstreamURL]];
     req.HTTPMethod = @"POST";
