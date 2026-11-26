@@ -54,9 +54,10 @@ static const NSUInteger kInputCharBudget = 480000;
 // value of 200 still cannot trip the upstream cap.
 static const NSUInteger kUpstreamCeiling = 96;
 
-// Metadata and response headers do not count as the first useful token. Give
-// a silent first attempt 20 seconds, then one fresh-connection retry with a
-// more generous budget. Once text or a tool call starts, never replay it.
+// Metadata and response headers do not count as the first useful token. Allow
+// a busy gateway longer to queue the request; if the first connection still
+// stalls, retry once on a fresh connection with a longer grace period. Once text
+// or a tool call starts, never replay it.
 typedef struct {
     NSTimeInterval headers;
     NSTimeInterval firstContent;
@@ -69,7 +70,8 @@ static RelayStreamLimits RelayStreamLimitsForAttempt(NSUInteger attempt) {
 #if defined(APELIN_RELAY_TESTING) && defined(APELIN_RELAY_TEST_TIMEOUT_SCALE)
     scale = APELIN_RELAY_TEST_TIMEOUT_SCALE;
 #endif
-    return (RelayStreamLimits){15.0 * scale, (attempt ? 45.0 : 20.0) * scale,
+    return (RelayStreamLimits){(attempt ? 90.0 : 45.0) * scale,
+                               (attempt ? 90.0 : 45.0) * scale,
                                120.0 * scale, 900.0 * scale};
 }
 

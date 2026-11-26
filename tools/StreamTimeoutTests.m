@@ -112,7 +112,10 @@ static void CompleteText(int fd, NSString *text, BOOL split) {
     NSUInteger index;
     @synchronized(self) { [self.requests addObject:json ?: @{}]; index = self.requests.count; }
     NSString *s = self.scenario;
-    if ([s isEqual:@"header-stall"] && index == 1) { usleep(1200000); return; }
+    if ([s isEqual:@"header-stall"] && index == 1) {
+        usleep((useconds_t)((RelayStreamLimitsForAttempt(0).headers + 0.2) * 1000000.0));
+        return;
+    }
     if ([s isEqual:@"http-error"]) {
         NSString *b = @"{\"error\":{\"message\":\"fixture unavailable\"}}";
         WriteString(fd, [NSString stringWithFormat:@"HTTP/1.1 503 Service Unavailable\r\nContent-Length: %lu\r\nConnection: close\r\n\r\n%@",
@@ -138,7 +141,10 @@ static void CompleteText(int fd, NSString *text, BOOL split) {
         CompleteText(fd, @"STALE_MUST_NOT_APPEAR", NO); return;
     }
     if ([s isEqual:@"both-stall"]) { usleep(3100000); return; }
-    if ([s isEqual:@"retry-grace"] && index == 1) { usleep(1400000); return; }
+    if ([s isEqual:@"retry-grace"] && index == 1) {
+        usleep((useconds_t)((RelayStreamLimitsForAttempt(0).firstContent + 0.2) * 1000000.0));
+        return;
+    }
     if ([s isEqual:@"retry-grace"] && index == 2) usleep(1300000);
     if ([s isEqual:@"late-normal"]) usleep(650000);
     if ([s isEqual:@"partial-idle"] || [s isEqual:@"missing-end"]) {
