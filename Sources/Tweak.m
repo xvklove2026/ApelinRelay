@@ -38,8 +38,16 @@ static const int kRelayPort = 18791;
 
 // Keep a bounded history and retry a genuine conversation-limit notice with
 // the shorter rescue window. The latest actual user prompt is always retained.
-static const NSUInteger kForwardTurns = 16;
+// A native Responses client keeps the whole conversation; trimming too early is
+// a quality disadvantage nobody sees until the model forgets the task. The
+// default window is therefore generous, with the token budget below as the real
+// safeguard, and the settings sheet can still dial it down for cost or speed.
+static const NSUInteger kForwardTurns = 48;
 static const NSUInteger kRescueTurns = 6;
+
+// Rough character budget for the forwarded history (~120k tokens). Round
+// counting alone would let a few huge tool outputs blow past the model window.
+static const NSUInteger kInputCharBudget = 480000;
 
 // The upstream now allows a conversation of up to 100 rounds, so the window can
 // grow well past the old 20-round limit. Kept strictly under 100 so a settings
@@ -62,12 +70,13 @@ static RelayStreamLimits RelayStreamLimitsForAttempt(NSUInteger attempt) {
     scale = APELIN_RELAY_TEST_TIMEOUT_SCALE;
 #endif
     return (RelayStreamLimits){15.0 * scale, (attempt ? 45.0 : 20.0) * scale,
-                               60.0 * scale, 240.0 * scale};
+                               120.0 * scale, 900.0 * scale};
 }
 
 static long RelayPrefInt(NSString *key, long fallback);
 static void RelayApplyReasoning(NSMutableDictionary *upstream);
 static NSString *RelayResponseErrorText(id payload);
+static NSArray *RelayFitCharBudget(NSArray *messages);
 
 static NSUInteger RelayEffectiveMaxTurns(void) {
     long configured = RelayPrefInt(@"relayMaxTurns", kForwardTurns);
@@ -90,7 +99,7 @@ static os_log_t RelayLog(void) {
 
 #pragma mark - Socket helpers
 
-static void RelayWriteAll(int fd, const void *bytes, size_t length) {
+static BOOL RelayWriteAll(int fd, const void *bytes, size_t length) {
     const uint8_t *p = (const uint8_t *)bytes;
     size_t off = 0;
     while (off < length) {
@@ -102,8 +111,11 @@ static void RelayWriteAll(int fd, const void *bytes, size_t length) {
         if (n < 0 && errno == EINTR) {
             continue;
         }
-        break;  // peer went away; nothing useful left to do
+        // Peer went away: report it so a streaming request can cancel upstream
+        // instead of generating an answer nobody will read.
+        return NO;
     }
+    return YES;
 }
 
 static void RelaySendResponse(int fd, int status, const char *statusText,
@@ -543,7 +555,7 @@ static NSArray *RelayTrimMessages(NSArray *messages, NSUInteger maxTurns) {
         if (RelayMessageStartsTurn(m)) turns++;
     }
     if (turns <= maxTurns) {
-        return RelayTrimAssistantCycles(messages, maxTurns);
+        return RelayFitCharBudget(RelayTrimAssistantCycles(messages, maxTurns));
     }
     NSUInteger toDrop = turns - maxTurns;
     NSUInteger seen = 0;
@@ -563,7 +575,57 @@ static NSArray *RelayTrimMessages(NSArray *messages, NSUInteger maxTurns) {
         if (RelayMessageIsInstruction(message)) [window addObject:message];
     }
     [window addObjectsFromArray:[messages subarrayWithRange:NSMakeRange(start, messages.count - start)]];
-    return RelayTrimAssistantCycles(window, maxTurns);
+    return RelayFitCharBudget(RelayTrimAssistantCycles(window, maxTurns));
+}
+
+/// Conservative character cost of one message, used only for the budget guard.
+static NSUInteger RelayMessageCharCost(id message) {
+    if (![message isKindOfClass:[NSDictionary class]]) return 0;
+    NSUInteger cost = 16;
+    id content = ((NSDictionary *)message)[@"content"];
+    if ([content isKindOfClass:[NSString class]]) {
+        return cost + [(NSString *)content length];
+    }
+    if ([content isKindOfClass:[NSArray class]]) {
+        for (id part in (NSArray *)content) {
+            if (![part isKindOfClass:[NSDictionary class]]) continue;
+            id text = ((NSDictionary *)part)[@"text"];
+            if ([text isKindOfClass:[NSString class]]) cost += [(NSString *)text length];
+            id input = ((NSDictionary *)part)[@"input"];
+            if ([input isKindOfClass:[NSDictionary class]]) {
+                NSData *encoded = [NSJSONSerialization dataWithJSONObject:input options:0 error:NULL];
+                cost += encoded.length;
+            }
+        }
+    }
+    return cost;
+}
+
+/// Drops the oldest complete turns until the history fits the character budget.
+/// Round limits alone miss conversations whose few turns each carry a huge tool
+/// output; this keeps the newest context and still never cuts a tool result from
+/// the call it belongs to.
+static NSArray *RelayFitCharBudget(NSArray *messages) {
+    if (![messages isKindOfClass:[NSArray class]] || messages.count == 0) return messages;
+    NSUInteger total = 0;
+    for (id message in messages) total += RelayMessageCharCost(message);
+    if (total <= kInputCharBudget) return messages;
+
+    NSMutableArray *kept = [NSMutableArray array];
+    NSUInteger running = 0;
+    for (NSUInteger i = messages.count; i-- > 0; ) {
+        NSUInteger cost = RelayMessageCharCost(messages[i]);
+        if (kept.count > 0 && running + cost > kInputCharBudget) break;
+        running += cost;
+        [kept insertObject:messages[i] atIndex:0];
+    }
+    NSMutableArray *result = [NSMutableArray array];
+    for (id message in messages) {
+        if (RelayMessageIsInstruction(message)) [result addObject:message];
+        else break;
+    }
+    [result addObjectsFromArray:kept];
+    return result;
 }
 
 static BOOL RelayHasShorterWindow(NSArray *messages, NSArray *window, NSUInteger cap) {
@@ -827,24 +889,24 @@ static NSUInteger RelayCountTurns(NSArray *messages) {
 // Responses endpoint, reusing the trim/retry logic. This lets com.xx.xingchiapi
 // occupy the Anthropic slot instead of the OpenAI-compatible one.
 
-static void RelaySendSSEHeader(int fd) {
+static BOOL RelaySendSSEHeader(int fd) {
     NSString *head = @"HTTP/1.1 200 OK\r\n"
                      "Content-Type: text/event-stream\r\n"
                      "Connection: close\r\n"
                      "\r\n";
     NSData *data = [head dataUsingEncoding:NSUTF8StringEncoding];
-    RelayWriteAll(fd, data.bytes, data.length);
+    return RelayWriteAll(fd, data.bytes, data.length);
 }
 
-static void RelaySendAnthropicEvent(int fd, NSString *eventName, NSDictionary *payload) {
+static BOOL RelaySendAnthropicEvent(int fd, NSString *eventName, NSDictionary *payload) {
     NSData *json = [NSJSONSerialization dataWithJSONObject:payload options:0 error:NULL];
     if (json == nil) {
-        return;
+        return NO;
     }
     NSString *body = [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding];
     NSString *frame = [NSString stringWithFormat:@"event: %@\ndata: %@\n\n", eventName, body];
     NSData *data = [frame dataUsingEncoding:NSUTF8StringEncoding];
-    RelayWriteAll(fd, data.bytes, data.length);
+    return RelayWriteAll(fd, data.bytes, data.length);
 }
 
 /// Flattens an Anthropic content field (a string or a list of blocks) to text.
@@ -1483,12 +1545,15 @@ static void RelayHandleAnthropicStream(int fd, NSString *apiKey,
             __block BOOL anyTool = NO;
             __block BOOL currentBlockOpen = NO;
             __block NSString *currentBlockType = nil;
+            __block long long reportedInputTokens = 0;
+            __block long long reportedOutputTokens = 0;
+            __block BOOL clientGone = NO;
 
             void (^stopCurrent)(void) = ^{
                 if (currentBlockOpen) {
-                    RelaySendAnthropicEvent(fd, @"content_block_stop", @{
+                    if (!RelaySendAnthropicEvent(fd, @"content_block_stop", @{
                         @"type": @"content_block_stop", @"index": @(blockIndex),
-                    });
+                    })) clientGone = YES;
                     currentBlockOpen = NO;
                     currentBlockType = nil;
                 }
@@ -1497,10 +1562,10 @@ static void RelayHandleAnthropicStream(int fd, NSString *apiKey,
                 if (!currentBlockOpen || ![currentBlockType isEqualToString:@"text"]) {
                     if (currentBlockOpen) stopCurrent();
                     blockIndex++;
-                    RelaySendAnthropicEvent(fd, @"content_block_start", @{
+                    if (!RelaySendAnthropicEvent(fd, @"content_block_start", @{
                         @"type": @"content_block_start", @"index": @(blockIndex),
                         @"content_block": @{@"type": @"text", @"text": @""},
-                    });
+                    })) clientGone = YES;
                     currentBlockOpen = YES;
                     currentBlockType = @"text";
                 }
@@ -1515,10 +1580,10 @@ static void RelayHandleAnthropicStream(int fd, NSString *apiKey,
             __block BOOL released = NO;
 
             void (^emitDelta)(NSString *) = ^(NSString *delta) {
-                RelaySendAnthropicEvent(fd, @"content_block_delta", @{
+                if (!RelaySendAnthropicEvent(fd, @"content_block_delta", @{
                     @"type": @"content_block_delta", @"index": @(blockIndex),
                     @"delta": @{@"type": @"text_delta", @"text": delta},
-                });
+                })) clientGone = YES;
             };
             void (^flushPending)(void) = ^{
                 if (pending.length == 0) return;
@@ -1547,7 +1612,7 @@ static void RelayHandleAnthropicStream(int fd, NSString *apiKey,
                                     ? ((NSDictionary *)item)[@"call_id"] : @"";
                                 NSString *fnName = [((NSDictionary *)item)[@"name"] isKindOfClass:[NSString class]]
                                     ? ((NSDictionary *)item)[@"name"] : @"";
-                                RelaySendAnthropicEvent(fd, @"content_block_start", @{
+                                if (!RelaySendAnthropicEvent(fd, @"content_block_start", @{
                                     @"type": @"content_block_start",
                                     @"index": @(blockIndex),
                                     @"content_block": @{
@@ -1556,7 +1621,7 @@ static void RelayHandleAnthropicStream(int fd, NSString *apiKey,
                                         @"name": fnName,
                                         @"input": @{},
                                     },
-                                });
+                                })) clientGone = YES;
                                 currentBlockOpen = YES;
                                 currentBlockType = @"tool";
                             }
@@ -1587,21 +1652,38 @@ static void RelayHandleAnthropicStream(int fd, NSString *apiKey,
                         id delta = payload[@"delta"];
                         if ([delta isKindOfClass:[NSString class]] && ((NSString *)delta).length > 0 &&
                             currentBlockOpen && [currentBlockType isEqualToString:@"tool"]) {
-                            RelaySendAnthropicEvent(fd, @"content_block_delta", @{
+                            if (!RelaySendAnthropicEvent(fd, @"content_block_delta", @{
                                 @"type": @"content_block_delta",
                                 @"index": @(blockIndex),
                                 @"delta": @{@"type": @"input_json_delta", @"partial_json": delta},
-                            });
+                            })) clientGone = YES;
                         }
                     } else if ([name isEqualToString:@"response.content_part.done"] ||
                                [name isEqualToString:@"response.output_item.done"]) {
+                        stopCurrent();
+                    } else if ([name isEqualToString:@"response.completed"]) {
+                        id usage = payload[@"response"];
+                        if ([usage isKindOfClass:[NSDictionary class]]) {
+                            usage = ((NSDictionary *)usage)[@"usage"];
+                        }
+                        if (![usage isKindOfClass:[NSDictionary class]]) usage = payload[@"usage"];
+                        if ([usage isKindOfClass:[NSDictionary class]]) {
+                            id inputTokens = ((NSDictionary *)usage)[@"input_tokens"];
+                            id outputTokens = ((NSDictionary *)usage)[@"output_tokens"];
+                            if ([inputTokens isKindOfClass:[NSNumber class]]) {
+                                reportedInputTokens = [inputTokens longLongValue];
+                            }
+                            if ([outputTokens isKindOfClass:[NSNumber class]]) {
+                                reportedOutputTokens = [outputTokens longLongValue];
+                            }
+                        }
                         stopCurrent();
                     }
                 } @catch (NSException *e) {
                     os_log_error(RelayLog(), "relay anthropic stream event failed: %{public}s",
                                  e.reason.UTF8String ?: "?");
                 }
-                return YES;
+                return !clientGone;
             };
 
             // Sequential retry only: no parallel paid requests. Metadata and
@@ -1753,7 +1835,10 @@ static void RelayHandleAnthropicStream(int fd, NSString *apiKey,
             RelaySendAnthropicEvent(fd, @"message_delta", @{
                 @"type": @"message_delta",
                 @"delta": @{@"stop_reason": stopReason, @"stop_sequence": (id)[NSNull null]},
-                @"usage": @{@"output_tokens": @(blockIndex + 1)},
+                @"usage": @{
+                    @"input_tokens": @(reportedInputTokens),
+                    @"output_tokens": @(reportedOutputTokens ?: (long long)(blockIndex + 1)),
+                },
             });
             RelaySendAnthropicEvent(fd, @"message_stop", @{@"type": @"message_stop"});
             break;
@@ -1768,10 +1853,10 @@ static void RelayHandleAnthropicStream(int fd, NSString *apiKey,
 }
 
 /// Writes an already-framed SSE string to the client.
-static void RelaySendSSEString(int fd, NSString *text) {
-    if (text.length == 0) return;
+static BOOL RelaySendSSEString(int fd, NSString *text) {
+    if (text.length == 0) return YES;
     NSData *data = [text dataUsingEncoding:NSUTF8StringEncoding];
-    RelayWriteAll(fd, data.bytes, data.length);
+    return RelayWriteAll(fd, data.bytes, data.length);
 }
 
 /// Streams one OpenAI-compatible chat/completions request. The upstream already
@@ -1782,9 +1867,9 @@ static void RelayHandleChatStream(int fd, NSString *apiKey, NSString *model,
                                   NSArray *fullMessages, id tools, id toolChoice,
                                   id maxTokens, NSUInteger forwardTurns) {
     @try {
-        RelaySendSSEHeader(fd);
-        RelaySendSSEString(fd, RelayMakeChunk(model,
-            @{@"role": @"assistant", @"content": @""}, nil));
+        if (!RelaySendSSEHeader(fd)) return;
+        if (!RelaySendSSEString(fd, RelayMakeChunk(model,
+            @{@"role": @"assistant", @"content": @""}, nil))) return;
 
         NSArray *window = RelayTrimMessages(fullMessages, forwardTurns);
         NSMutableDictionary *upstream = [NSMutableDictionary dictionary];
@@ -1803,6 +1888,7 @@ static void RelayHandleChatStream(int fd, NSString *apiKey, NSString *model,
         __block NSInteger toolIndex = -1;
         __block BOOL anyTool = NO;
         __block BOOL finished = NO;
+        __block BOOL clientGone = NO;
 
         // No notice buffering here: passthrough is the whole point, so the very
         // first generated token reaches the client immediately.
@@ -1818,26 +1904,28 @@ static void RelayHandleChatStream(int fd, NSString *apiKey, NSString *model,
                             ? ((NSDictionary *)item)[@"call_id"] : @"";
                         NSString *fnName = [((NSDictionary *)item)[@"name"] isKindOfClass:[NSString class]]
                             ? ((NSDictionary *)item)[@"name"] : @"";
-                        RelaySendSSEString(fd, RelayMakeChunk(model, @{@"tool_calls": @[@{
+                        if (!RelaySendSSEString(fd, RelayMakeChunk(model, @{@"tool_calls": @[@{
                             @"index": @(toolIndex),
                             @"id": callID,
                             @"type": @"function",
                             @"function": @{@"name": fnName, @"arguments": @""},
-                        }]}, nil));
+                        }]}, nil))) clientGone = YES;
                     }
                 } else if ([name isEqualToString:@"response.output_text.delta"]) {
                     id delta = payload[@"delta"];
                     if ([delta isKindOfClass:[NSString class]] && ((NSString *)delta).length > 0) {
-                        RelaySendSSEString(fd, RelayMakeChunk(model, @{@"content": delta}, nil));
+                        if (!RelaySendSSEString(fd, RelayMakeChunk(model, @{@"content": delta}, nil))) {
+                            clientGone = YES;
+                        }
                     }
                 } else if ([name isEqualToString:@"response.function_call_arguments.delta"]) {
                     id delta = payload[@"delta"];
                     if ([delta isKindOfClass:[NSString class]] && ((NSString *)delta).length > 0 &&
                         toolIndex >= 0) {
-                        RelaySendSSEString(fd, RelayMakeChunk(model, @{@"tool_calls": @[@{
+                        if (!RelaySendSSEString(fd, RelayMakeChunk(model, @{@"tool_calls": @[@{
                             @"index": @(toolIndex),
                             @"function": @{@"arguments": delta},
-                        }]}, nil));
+                        }]}, nil))) clientGone = YES;
                     }
                 } else if ([name isEqualToString:@"response.completed"]) {
                     finished = YES;
@@ -1846,7 +1934,7 @@ static void RelayHandleChatStream(int fd, NSString *apiKey, NSString *model,
                 os_log_error(RelayLog(), "relay chat stream event failed: %{public}s",
                              e.reason.UTF8String ?: "?");
             }
-            return YES;
+            return !clientGone;
         };
 
         NSString *upstreamError = nil;
