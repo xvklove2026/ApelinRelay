@@ -1,0 +1,10 @@
+Package: com.xx.xingchiapi
+Name: Apelin Relay
+Version: 0.0.3
+Architecture: iphoneos-arm64
+Section: Tweaks
+Maintainer: xx <xvklove2024@gmail.com>
+Author: xx <xvklove2024@gmail.com>
+Depends: firmware (>= 16.0), mobilesubstrate
+Replaces: local.apelin.apelinrelay
+Description: 把 OpenAI chat/completions 翻译为 xingchiapi 的 Responses API，供 Apelin 使用。

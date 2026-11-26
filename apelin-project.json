@@ -26,6 +26,7 @@
       "arm64e"
     ],
     "roothide": [
+      "arm64",
       "arm64e"
     ]
   },
@@ -102,7 +103,7 @@
   "package": {
     "id": "com.xx.xingchiapi",
     "name": "Apelin Relay",
-    "version": "0.0.2",
+    "version": "0.0.3",
     "description": "把 OpenAI chat/completions 翻译为 xingchiapi 的 Responses API，供 Apelin 使用。",
     "icon": "https://owngoal-dev.github.io/Apelin/icons/wiki.qaq.apelin.dev.tweak.png",
     "author": "xx",

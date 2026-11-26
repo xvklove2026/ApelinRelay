@@ -1,0 +1,102 @@
+name: build
+
+# Builds the tweak the only way possible for this project: on a Mac, because the
+# target device (iPhone X, A11) cannot host any Apple command line tools — every
+# release Apelin can install needs FEAT_LRCPC, which A11 lacks.
+#
+# The dylib must carry both arm64 and arm64e: arm64e alone is what dyld refused
+# to load on the A11 device, arm64 alone would leave A12+ devices out.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  compile:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile the dylib (arm64 + arm64e)
+        run: |
+          set -euo pipefail
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          BUILD_ID="ci-${GITHUB_SHA::7}"
+          mkdir -p out
+          xcrun --sdk iphoneos clang \
+            -arch arm64 -arch arm64e \
+            -miphoneos-version-min=16.0 \
+            -isysroot "$SDK" \
+            -dynamiclib -fobjc-arc -O2 \
+            -DAPELIN_PACKAGE_ID='"com.xx.xingchiapi"' \
+            -DAPELIN_BUILD_ID="\"${BUILD_ID}\"" \
+            -Ici/include \
+            -framework Foundation -framework UIKit \
+            -undefined dynamic_lookup \
+            -install_name /Library/MobileSubstrate/DynamicLibraries/ApelinRelay.dylib \
+            -o out/ApelinRelay.dylib \
+            Sources/Tweak.m
+
+      - name: Assert both slices exist
+        run: |
+          set -euo pipefail
+          lipo -archs out/ApelinRelay.dylib
+          lipo out/ApelinRelay.dylib -thin arm64  -output /tmp/arm64.dylib
+          lipo out/ApelinRelay.dylib -thin arm64e -output /tmp/arm64e.dylib
+          codesign --force --sign - out/ApelinRelay.dylib
+          codesign -dv out/ApelinRelay.dylib 2>&1 | head -5
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dylib
+          path: out/ApelinRelay.dylib
+          if-no-files-found: error
+
+  package:
+    needs: compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dylib
+          path: out
+
+      - name: Assemble the deb
+        run: |
+          set -euo pipefail
+          VERSION="$(sed -n 's/^Version: *//p' ci/control)"
+          ROOT=pkg
+          mkdir -p "$ROOT/DEBIAN" "$ROOT/Library/MobileSubstrate/DynamicLibraries"
+          install -m 0755 out/ApelinRelay.dylib "$ROOT/Library/MobileSubstrate/DynamicLibraries/ApelinRelay.dylib"
+          install -m 0644 ci/ApelinRelay.plist   "$ROOT/Library/MobileSubstrate/DynamicLibraries/ApelinRelay.plist"
+          install -m 0644 ci/control             "$ROOT/DEBIAN/control"
+          dpkg-deb -Zgzip -b "$ROOT" "ApelinRelay_${VERSION}_iphoneos-arm64.deb"
+          echo "--- control"
+          dpkg-deb -I "ApelinRelay_${VERSION}_iphoneos-arm64.deb"
+          echo "--- contents"
+          dpkg-deb -c "ApelinRelay_${VERSION}_iphoneos-arm64.deb"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb
+          path: ApelinRelay_*.deb
+          if-no-files-found: error
+
+      - name: Attach to a release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          name: ApelinRelay build ${{ github.run_number }}
+          body: |
+            `ApelinRelay_*_iphoneos-arm64.deb` — arm64 + arm64e, roothide 布局
+            (`/Library/MobileSubstrate/DynamicLibraries/`)。
+            在 iPhone X (A11) 上必须用这一版：之前只含 arm64e，dyld 拒绝加载。
+          files: ApelinRelay_*.deb
