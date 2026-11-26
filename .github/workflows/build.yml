@@ -72,16 +72,18 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="$(sed -n 's/^Version: *//p' ci/control)"
+          ARCH="$(sed -n 's/^Architecture: *//p' ci/control)"
+          DEB="ApelinRelay_${VERSION}_${ARCH}.deb"
           ROOT=pkg
           mkdir -p "$ROOT/DEBIAN" "$ROOT/Library/MobileSubstrate/DynamicLibraries"
           install -m 0755 out/ApelinRelay.dylib "$ROOT/Library/MobileSubstrate/DynamicLibraries/ApelinRelay.dylib"
           install -m 0644 ci/ApelinRelay.plist   "$ROOT/Library/MobileSubstrate/DynamicLibraries/ApelinRelay.plist"
           install -m 0644 ci/control             "$ROOT/DEBIAN/control"
-          dpkg-deb -Zgzip -b "$ROOT" "ApelinRelay_${VERSION}_iphoneos-arm64.deb"
+          dpkg-deb -Zgzip -b "$ROOT" "$DEB"
           echo "--- control"
-          dpkg-deb -I "ApelinRelay_${VERSION}_iphoneos-arm64.deb"
+          dpkg-deb -I "$DEB"
           echo "--- contents"
-          dpkg-deb -c "ApelinRelay_${VERSION}_iphoneos-arm64.deb"
+          dpkg-deb -c "$DEB"
 
       - uses: actions/upload-artifact@v4
         with:

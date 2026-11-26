@@ -1,7 +1,7 @@
 Package: com.xx.xingchiapi
 Name: Apelin Relay
 Version: 0.0.3
-Architecture: iphoneos-arm64
+Architecture: iphoneos-arm64e
 Section: Tweaks
 Maintainer: xx <xvklove2024@gmail.com>
 Author: xx <xvklove2024@gmail.com>
